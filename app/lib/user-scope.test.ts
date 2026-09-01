@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   authenticatedUser,
   hasExpectedUserContext,
+  isUserStorageKey,
   isValidAuthenticatedUserId,
   MAX_AUTHENTICATED_EMAIL_LENGTH,
   MAX_AUTHENTICATED_USER_ID_LENGTH,
@@ -31,6 +32,12 @@ test('不同用户始终使用不同的浏览器缓存空间', () => {
   assert.notEqual(storageKeyForUser('user-a'), storageKeyForUser('user-b'));
   assert.notEqual(storageKeyForUser('user-a'), storageKeyForUser('user-a/other-site'));
   assert.match(storageKeyForUser('user-a/other-site'), /user-a%2Fother-site$/);
+});
+
+test('仅识别职序的账号隔离缓存键', () => {
+  assert.equal(isUserStorageKey(storageKeyForUser('user-a')), true);
+  assert.equal(isUserStorageKey('career-pipeline-user-state-v2'), false);
+  assert.equal(isUserStorageKey('unrelated-application-state:user-a'), false);
 });
 
 test('邮箱相同也不能替代用户 ID 作为隔离边界', () => {

@@ -39,3 +39,7 @@ export function storageKeyForUser(userId: string) {
   if (!isValidAuthenticatedUserId(normalized)) throw new Error('Authenticated user ID is invalid.');
   return `${USER_STORAGE_KEY_PREFIX}:${encodeURIComponent(normalized)}`;
 }
+
+export function isUserStorageKey(value: string) {
+  return value.startsWith(`${USER_STORAGE_KEY_PREFIX}:`);
+}

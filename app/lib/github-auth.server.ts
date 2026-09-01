@@ -496,11 +496,21 @@ export function createGithubAuthHandlers(dependencies: GithubAuthDependencies) {
   };
 
   const SIGNOUT = async (request: Request) => {
+    const signedOutResponse = (body: unknown, status: number) => {
+      const headers = privateHeaders();
+      headers.set('x-zhixu-device-session-cleared', '1');
+      headers.append('set-cookie', clearCookie(GITHUB_SESSION_COOKIE));
+      headers.append('set-cookie', clearCookie(GITHUB_OAUTH_STATE_COOKIE));
+      return Response.json(body, { status, headers });
+    };
     let configuration: ReturnType<typeof validatedGithubConfiguration>;
     try {
       configuration = validatedGithubConfiguration(dependencies.configuration());
     } catch {
-      return privateJson({ error: 'github_auth_unavailable' }, { status: 503 });
+      if (!requestOriginMatches(request, new URL(request.url).origin)) {
+        return privateJson({ error: 'invalid_request_origin' }, { status: 403 });
+      }
+      return signedOutResponse({ error: 'github_auth_unavailable' }, 503);
     }
     if (!requestOriginMatches(request, configuration.publicAppOrigin)) {
       return privateJson({ error: 'invalid_request_origin' }, { status: 403 });
@@ -518,11 +528,9 @@ export function createGithubAuthHandlers(dependencies: GithubAuthDependencies) {
         `).bind(now(), await sha256Base64Url(token)).run();
       }
       await bestEffortCleanupGithubAuthRecords(database, now());
-      const headers = privateHeaders();
-      headers.append('set-cookie', clearCookie(GITHUB_SESSION_COOKIE));
-      return Response.json({ ok: true }, { headers });
+      return signedOutResponse({ ok: true }, 200);
     } catch {
-      return privateJson({ error: 'github_signout_unavailable' }, { status: 503 });
+      return signedOutResponse({ error: 'github_signout_unavailable' }, 503);
     }
   };
 

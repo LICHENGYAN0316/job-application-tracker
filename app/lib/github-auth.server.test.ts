@@ -124,6 +124,7 @@ class FakeStatement implements GithubAuthStatement {
     }
 
     if (/UPDATE\s+github_sessions/i.test(this.query)) {
+      if (this.database.failSessionUpdate) throw new Error('Simulated GitHub session update failure');
       const [revokedAt, sessionHash] = this.values;
       const row = this.database.sessions.get(String(sessionHash));
       if (!row || row.revoked_at_ms !== null) return { meta: { changes: 0 } };
@@ -139,6 +140,7 @@ class FakeDatabase implements GithubAuthDatabase {
   readonly oauthStates = new Map<string, OauthStateRow>();
   readonly sessions = new Map<string, SessionRow>();
   failCleanup = false;
+  failSessionUpdate = false;
 
   prepare(query: string) {
     return new FakeStatement(query, this);
@@ -454,6 +456,7 @@ test('signout is same-origin POST, removes the revoked session, and clears the c
     headers: { cookie: `${GITHUB_SESSION_COOKIE}=${token}`, origin: 'https://evil.example' },
   }));
   assert.equal(crossOrigin.status, 403);
+  assert.equal(crossOrigin.headers.get('x-zhixu-device-session-cleared'), null);
   assert.equal(database.sessions.get(hash)?.revoked_at_ms, null);
 
   const signedOut = await handlers.SIGNOUT(new Request('https://example.com/api/auth/github/signout', {
@@ -461,8 +464,41 @@ test('signout is same-origin POST, removes the revoked session, and clears the c
     headers: { cookie: `${GITHUB_SESSION_COOKIE}=${token}`, origin: 'https://example.com' },
   }));
   assert.equal(signedOut.status, 200);
+  assert.equal(signedOut.headers.get('x-zhixu-device-session-cleared'), '1');
   assert.equal(database.sessions.has(hash), false);
   assert.equal(cookieValue(signedOut, GITHUB_SESSION_COOKIE), '');
+  assert.equal(cookieValue(signedOut, GITHUB_OAUTH_STATE_COOKIE), '');
+});
+
+test('signout still clears this device cookies when session revocation is unavailable', async () => {
+  const database = new FakeDatabase();
+  const token = 'u'.repeat(43);
+  const hash = await sha256Base64Url(token);
+  database.sessions.set(hash, {
+    session_hash: hash,
+    account_key: 'github:10',
+    github_subject: '10',
+    display_login: 'ten',
+    created_at_ms: 1,
+    expires_at_ms: 2_000_000_000_000,
+    revoked_at_ms: null,
+  });
+  database.failSessionUpdate = true;
+  const handlers = createGithubAuthHandlers(dependencies(database));
+
+  const response = await handlers.SIGNOUT(new Request('https://example.com/api/auth/github/signout', {
+    method: 'POST',
+    headers: {
+      cookie: `${GITHUB_SESSION_COOKIE}=${token}; ${GITHUB_OAUTH_STATE_COOKIE}=pending-state`,
+      origin: 'https://example.com',
+    },
+  }));
+
+  assert.equal(response.status, 503);
+  assert.equal(response.headers.get('x-zhixu-device-session-cleared'), '1');
+  assert.equal(database.sessions.get(hash)?.revoked_at_ms, null);
+  assert.equal(cookieValue(response, GITHUB_SESSION_COOKIE), '');
+  assert.equal(cookieValue(response, GITHUB_OAUTH_STATE_COOKIE), '');
 });
 
 test('malformed cookies are ignored', () => {

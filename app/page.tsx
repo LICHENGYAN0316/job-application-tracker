@@ -11,7 +11,7 @@ import {
   type NavigatorCommandResult,
 } from './lib/career-navigator';
 import { CORE_STAGES, jobIdentityKey, STAGES, type Stage } from './lib/domain';
-import { storageKeyForUser } from './lib/user-scope';
+import { isUserStorageKey, storageKeyForUser } from './lib/user-scope';
 
 type ProcessEvent = {
   id: string;
@@ -174,6 +174,8 @@ const LEGACY_STORAGE_KEY = 'local-job-application-tracker-v1';
 const NO_STATE_VERSION = 'none';
 const MAX_STATE_BYTES = 2_000_000;
 const MAX_BACKUP_BYTES = 4_000_000;
+const DEVICE_SESSION_CLEARED_HEADER = 'x-zhixu-device-session-cleared';
+const AUTH_DISCONNECT_TIMEOUT_MS = 10_000;
 const AGENT_TECHNICAL_FAILURE_MESSAGE = '这次没有成功完成分析，但你的求职数据没有受到影响，也不会扣除使用次数。你可以稍后重试，或切换到基础助手继续使用。';
 const AGENT_STATUS_CACHE_MS = 30_000;
 const AGENT_ADMIN_CACHE_MS = 30_000;
@@ -929,6 +931,8 @@ export default function Home() {
   const [deletingData, setDeletingData] = useState(false);
   const [deleteNeedsRefresh, setDeleteNeedsRefresh] = useState(false);
   const [accountActionError, setAccountActionError] = useState('');
+  const [authDisconnecting, setAuthDisconnecting] = useState(false);
+  const [authDisconnectError, setAuthDisconnectError] = useState('');
   const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmation | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const cloudSyncEnabled = useRef(false);
@@ -1058,6 +1062,8 @@ export default function Home() {
     setDeletingData(false);
     setDeleteNeedsRefresh(false);
     setAccountActionError('');
+    setAuthDisconnecting(false);
+    setAuthDisconnectError('');
     setPendingConfirmation(null);
     setNotice(null);
     if (backupInputRef.current) backupInputRef.current.value = '';
@@ -2098,6 +2104,52 @@ export default function Home() {
       }
       return;
     }
+    window.location.replace('/signout-with-chatgpt?return_to=/');
+  };
+
+  const disconnectThisDeviceAndRestart = async () => {
+    if (authDisconnecting) return;
+    setAuthDisconnecting(true);
+    setAuthDisconnectError('');
+    cloudSyncEnabled.current = false;
+    saveSequence.current += 1;
+    if (saveTimerRef.current !== null) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    saveAbortControllerRef.current?.abort();
+    saveAbortControllerRef.current = null;
+
+    try {
+      const keysToRemove: string[] = [];
+      for (let index = 0; index < window.localStorage.length; index += 1) {
+        const key = window.localStorage.key(index);
+        if (key && (key === LEGACY_STORAGE_KEY || isUserStorageKey(key))) keysToRemove.push(key);
+      }
+      for (const key of keysToRemove) window.localStorage.removeItem(key);
+    } catch {
+      // The remote sessions can still be disconnected when browser storage is unavailable.
+    }
+
+    const disconnectController = new AbortController();
+    const disconnectTimeout = window.setTimeout(() => disconnectController.abort(), AUTH_DISCONNECT_TIMEOUT_MS);
+    try {
+      const response = await fetch('/api/auth/github/signout', {
+        method: 'POST',
+        credentials: 'same-origin',
+        signal: disconnectController.signal,
+      });
+      if (response.headers.get(DEVICE_SESSION_CLEARED_HEADER) !== '1') {
+        throw new Error('device_session_not_cleared');
+      }
+    } catch {
+      setAuthDisconnecting(false);
+      setAuthDisconnectError('本机缓存已清除，但当前连接未能安全切断登录。请检查网络后再试一次。');
+      return;
+    } finally {
+      window.clearTimeout(disconnectTimeout);
+    }
+
     window.location.replace('/signout-with-chatgpt?return_to=/');
   };
 
@@ -3272,9 +3324,23 @@ export default function Home() {
           <BrandSignature />
           <p className="eyebrow">账号空间保护</p>
           <h1>暂时无法打开当前账号</h1>
-          <p>系统没有读取或显示其他用户的缓存。请重新连接，或退出后重新登录当前账号。</p>
-          <button className="primary-button auth-button" onClick={() => window.location.replace(window.location.href)}>重新连接</button>
-          <button className="auth-privacy-link" onClick={signOutAndClearDevice}>退出并重新登录</button>
+          <p className="auth-recovery-copy">
+            <span>确认当前账号后，工作台才会打开。</span>
+            <span>避免共享设备误显其他账号缓存。</span>
+          </p>
+          <div className="auth-recovery-actions" aria-live="polite">
+            <button className="primary-button auth-button" disabled={authDisconnecting} onClick={() => window.location.replace(window.location.href)}>重新连接</button>
+            <button
+              className="secondary-button auth-button"
+              disabled={authDisconnecting}
+              aria-busy={authDisconnecting}
+              onClick={disconnectThisDeviceAndRestart}
+            >
+              {authDisconnecting ? '正在切断本机连接…' : '一键切断并重新登录'}
+            </button>
+          </div>
+          <p className="auth-recovery-note">只清除此设备的登录状态和职序缓存，不会删除云端求职数据。</p>
+          {authDisconnectError && <p className="auth-inline-notice" role="alert">{authDisconnectError}</p>}
         </section>
       </main>
     );
@@ -3288,10 +3354,25 @@ export default function Home() {
             <BrandSignature />
             <p className="eyebrow">登录状态保护</p>
             <h1>暂时无法确认登录账号</h1>
-            <p>为避免在共享设备上显示其他账号的缓存，连接恢复并确认账号前不会打开工作台。</p>
-            <button className="primary-button auth-button" onClick={() => window.location.replace(window.location.href)}>
-              重新连接
-            </button>
+            <p className="auth-recovery-copy">
+              <span>确认当前账号后，工作台才会打开。</span>
+              <span>避免共享设备误显其他账号缓存。</span>
+            </p>
+            <div className="auth-recovery-actions" aria-live="polite">
+              <button className="primary-button auth-button" disabled={authDisconnecting} onClick={() => window.location.replace(window.location.href)}>
+                重新连接
+              </button>
+              <button
+                className="secondary-button auth-button"
+                disabled={authDisconnecting}
+                aria-busy={authDisconnecting}
+                onClick={disconnectThisDeviceAndRestart}
+              >
+                {authDisconnecting ? '正在切断本机连接…' : '一键切断并重新登录'}
+              </button>
+            </div>
+            <p className="auth-recovery-note">只清除此设备的登录状态和职序缓存，不会删除云端求职数据。</p>
+            {authDisconnectError && <p className="auth-inline-notice" role="alert">{authDisconnectError}</p>}
             <button className="auth-privacy-link" onClick={openPrivacy}>隐私与数据说明</button>
           </section>
         </main>
