@@ -289,6 +289,21 @@ function BrandMark() {
   );
 }
 
+function NavigatorMark() {
+  return (
+    <Image
+      className="navigator-mark-image"
+      src="/career-navigator-mark.png"
+      alt=""
+      aria-hidden="true"
+      width={512}
+      height={512}
+      sizes="(max-width: 640px) 44px, 50px"
+      unoptimized
+    />
+  );
+}
+
 function BrandSignature() {
   return (
     <div className="brand-signature" aria-label="职序，Career Rhythm">
@@ -2602,7 +2617,7 @@ export default function Home() {
         </section>
 
         <section className="navigator-overview" aria-labelledby="navigator-overview-title">
-          <div className="navigator-overview-mark" aria-hidden="true">领</div>
+          <div className="navigator-overview-mark" aria-hidden="true"><NavigatorMark /></div>
           <div className="navigator-overview-copy">
             <p className="eyebrow">{NAVIGATOR_NAME} · 今日简报</p>
             <h2 id="navigator-overview-title">{navigatorBriefing.healthLabel}</h2>
@@ -3287,7 +3302,7 @@ export default function Home() {
         >
           <div className="navigator-dialog">
             <section className="navigator-dialog-hero">
-              <div className="navigator-dialog-mark" aria-hidden="true">领</div>
+              <div className="navigator-dialog-mark" aria-hidden="true"><NavigatorMark /></div>
               <div>
                 <p className="eyebrow">{NAVIGATOR_ENGLISH_NAME}</p>
                 <h3>{navigatorBriefing.healthLabel}</h3>

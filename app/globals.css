@@ -435,7 +435,8 @@ button:disabled, input:disabled, select:disabled, textarea:disabled { cursor: no
   box-shadow: var(--shadow-soft);
 }
 .navigator-overview-mark,
-.navigator-dialog-mark { display: grid; width: 50px; height: 50px; place-items: center; border-radius: 15px; background: linear-gradient(145deg, #d98250, #b95832); color: white; font-family: var(--font-display); font-size: 22px; box-shadow: 0 10px 24px rgb(173 83 45 / 18%); }
+.navigator-dialog-mark { display: grid; width: 50px; height: 50px; overflow: hidden; place-items: center; border-radius: 15px; background: var(--color-accent); box-shadow: 0 10px 24px rgb(173 83 45 / 18%); }
+.navigator-mark-image { display: block; width: 100%; height: 100%; object-fit: cover; object-position: center; }
 .navigator-overview-copy { min-width: 0; }
 .navigator-overview-copy .eyebrow { margin-bottom: 3px; }
 .navigator-overview-copy h2 { margin: 0; font-family: var(--font-display); font-size: var(--text-xl); font-weight: 500; letter-spacing: -.02em; }
@@ -1087,7 +1088,7 @@ button:disabled, input:disabled, select:disabled, textarea:disabled { cursor: no
   .hero-copy { margin-top: 8px; font-size: var(--text-base); line-height: 1.55; }
   .hero-action { width: 100%; min-height: 44px; }
   .navigator-overview { grid-template-columns: 44px minmax(0, 1fr) 100px; gap: 8px; margin-bottom: 12px; padding: 12px; }
-  .navigator-overview-mark { width: 44px; height: 44px; border-radius: 13px; font-size: 19px; }
+  .navigator-overview-mark { width: 44px; height: 44px; border-radius: 13px; }
   .navigator-overview-copy { grid-column: 2 / 4; }
   .navigator-overview-copy h2 { font-size: 18px; }
   .navigator-overview-copy > p:last-child { margin-top: 2px; line-height: 1.45; }
@@ -1148,7 +1149,7 @@ button:disabled, input:disabled, select:disabled, textarea:disabled { cursor: no
   .toast-region { top: calc(var(--space-3) + env(safe-area-inset-top)); right: var(--space-4); left: var(--space-4); width: auto; }
   .navigator-dialog { padding: var(--space-4) var(--space-5) calc(var(--space-6) + env(safe-area-inset-bottom)); }
   .navigator-dialog-hero { grid-template-columns: 44px minmax(0, 1fr); align-items: start; padding: var(--space-4); }
-  .navigator-dialog-mark { width: 44px; height: 44px; border-radius: 13px; font-size: 19px; }
+  .navigator-dialog-mark { width: 44px; height: 44px; border-radius: 13px; }
   .navigator-dialog-hero h3 { font-size: 21px; }
   .navigator-dialog-score { grid-column: 2; flex-direction: row; align-items: baseline; justify-content: flex-start; gap: 5px; border-left: 0; padding-left: 0; }
   .navigator-dialog-score strong { font-size: 20px; }

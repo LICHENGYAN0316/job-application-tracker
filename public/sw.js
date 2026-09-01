@@ -1,7 +1,8 @@
-const CACHE_NAME = 'zhixu-static-v4';
+const CACHE_NAME = 'zhixu-static-v5';
 const PRECACHE_URLS = [
   '/manifest.webmanifest',
   '/brand-mark.png',
+  '/career-navigator-mark.png',
   '/favicon-32.png',
   '/apple-touch-icon.png',
   '/icon-192.png',
