@@ -482,6 +482,124 @@ test('existing-company add accepts blank optional fields and shows them as unfil
   assert.equal(stateFor(database)?.state.companies[0].jobs.length, 1);
 });
 
+test('requester-local relative dates override a stale model date for existing and missing companies', async (t) => {
+  const database = await databaseWithState();
+  t.after(() => database.close());
+  const existing = await prepareAgentActionFromToolCall({
+    database, principal: USER_A, sourceCallId: crypto.randomUUID(), sessionId: crypto.randomUUID(),
+    toolName: 'propose_add_job',
+    argumentsJson: JSON.stringify({
+      companyName: '星河能源', title: 'AI 产品经理', location: '', portalUrl: '', appliedAt: '2024-05-20',
+    }),
+    question: '加一个星河能源的 AI 产品经理岗位，投递日期写今天',
+    referenceDate: '2026-09-01',
+    now: () => NOW,
+  });
+  assert.equal(existing.kind, 'proposal');
+  if (existing.kind === 'proposal') {
+    assert.equal(existing.proposal.fields.find((field) => field.label === '投递日期')?.value, '2026-09-01');
+  }
+
+  const missing = await prepareAgentActionFromToolCall({
+    database, principal: USER_A, sourceCallId: crypto.randomUUID(), sessionId: crypto.randomUUID(),
+    toolName: 'propose_add_job',
+    argumentsJson: JSON.stringify({
+      companyName: '京东', title: '产品经理', location: '', portalUrl: '', appliedAt: '2024-05-20',
+    }),
+    question: '加一个京东的产品经理岗位，投递日期写今天',
+    referenceDate: '2026-09-01',
+    now: () => NOW,
+  });
+  assert.equal(missing.kind, 'proposal');
+  if (missing.kind === 'proposal') {
+    assert.equal(missing.proposal.actionKind, 'add_company_job');
+    assert.equal(missing.proposal.fields.find((field) => field.label === '投递日期')?.value, '2026-09-01');
+  }
+  assert.equal(stateFor(database)?.state.companies.length, 1);
+  assert.equal(stateFor(database)?.state.companies[0].jobs.length, 1);
+});
+
+test('date normalization preserves explicit empty and ISO dates and rejects a missing local-date reference', async (t) => {
+  const database = await databaseWithState();
+  t.after(() => database.close());
+  const empty = await prepareAgentActionFromToolCall({
+    database, principal: USER_A, sourceCallId: crypto.randomUUID(), sessionId: crypto.randomUUID(),
+    toolName: 'propose_add_job',
+    argumentsJson: JSON.stringify({
+      companyName: '星河能源', title: '交互产品经理', location: '', portalUrl: '', appliedAt: '2024-05-20',
+    }),
+    question: '今天想新增岗位，投递日期未填写',
+    now: () => NOW,
+  });
+  assert.equal(empty.kind, 'proposal');
+  if (empty.kind === 'proposal') {
+    assert.equal(empty.proposal.fields.find((field) => field.label === '投递日期')?.value, '未填写');
+  }
+
+  const explicit = await prepareAgentActionFromToolCall({
+    database, principal: USER_A, sourceCallId: crypto.randomUUID(), sessionId: crypto.randomUUID(),
+    toolName: 'propose_add_job',
+    argumentsJson: JSON.stringify({
+      companyName: '星河能源', title: '数据产品经理', location: '', portalUrl: '', appliedAt: '2026-09-01',
+    }),
+    question: '加一个数据产品经理岗位，投递日期写 2024-05-20',
+    now: () => NOW,
+  });
+  assert.equal(explicit.kind, 'proposal');
+  if (explicit.kind === 'proposal') {
+    assert.equal(explicit.proposal.fields.find((field) => field.label === '投递日期')?.value, '2024-05-20');
+  }
+
+  const invalidReference = await prepareAgentActionFromToolCall({
+    database, principal: USER_A, sourceCallId: crypto.randomUUID(), sessionId: crypto.randomUUID(),
+    toolName: 'propose_add_job',
+    argumentsJson: JSON.stringify({
+      companyName: '星河能源', title: '增长产品经理', location: '', portalUrl: '', appliedAt: '2024-05-20',
+    }),
+    question: '加一个增长产品经理岗位，投递日期写今天',
+    referenceDate: '',
+    now: () => NOW,
+  });
+  assert.equal(invalidReference.kind, 'clarification');
+  if (invalidReference.kind === 'clarification') assert.match(invalidReference.message, /当地的日期/);
+});
+
+test('unrequested dates are cleared from add tools and preserved by update tools', async (t) => {
+  const database = await databaseWithState();
+  t.after(() => database.close());
+  const added = await prepareAgentActionFromToolCall({
+    database, principal: USER_A, sourceCallId: crypto.randomUUID(), sessionId: crypto.randomUUID(),
+    toolName: 'propose_add_job',
+    argumentsJson: JSON.stringify({
+      companyName: '星河能源', title: '平台产品经理', location: '', portalUrl: '', appliedAt: '2024-05-20',
+    }),
+    question: '加一个平台产品经理岗位',
+    referenceDate: '2026-09-01',
+    now: () => NOW,
+  });
+  assert.equal(added.kind, 'proposal');
+  if (added.kind === 'proposal') {
+    assert.equal(added.proposal.fields.find((field) => field.label === '投递日期')?.value, '未填写');
+  }
+
+  const updated = await prepareAgentActionFromToolCall({
+    database, principal: USER_A, sourceCallId: crypto.randomUUID(), sessionId: crypto.randomUUID(),
+    toolName: 'propose_update_job',
+    argumentsJson: JSON.stringify({
+      companyName: '星河能源', title: '产品经理', location: '上海',
+      newTitle: null, newLocation: null, portalUrl: null, appliedAt: '2024-05-20',
+      stage: '一面', priority: null, nextAction: null, nextDate: '2024-05-21',
+    }),
+    question: '把星河能源的产品经理岗位推进到一面',
+    referenceDate: '2026-09-01',
+    now: () => NOW,
+  });
+  assert.equal(updated.kind, 'proposal');
+  if (updated.kind === 'proposal') {
+    assert.equal(updated.proposal.fields.some((field) => /日期/.test(field.label)), false);
+  }
+});
+
 test('missing-company add becomes one confirmed company-and-job proposal without pre-confirmation writes', async (t) => {
   const database = await databaseWithState();
   t.after(() => database.close());

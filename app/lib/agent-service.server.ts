@@ -1,6 +1,7 @@
 import type { AuthPrincipal } from './auth-principal.server.ts';
 import {
   AGENT_ACTION_TOOLS,
+  agentQuestionUsesRelativeDate,
   prepareAgentActionFromToolCall,
   type AgentActionPreview,
 } from './agent-actions.server.ts';
@@ -109,6 +110,43 @@ const ALLOWED_STAGE_VALUES = new Set([
 function boundedText(value: unknown, maxLength: number) {
   if (typeof value !== 'string') return '';
   return value.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').trim().slice(0, maxLength);
+}
+
+export function normalizeAgentTimeZone(value: unknown) {
+  if (typeof value !== 'string') return '';
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(value)) return '';
+  const normalized = value.trim();
+  if (
+    !normalized
+    || normalized.length > 100
+    || !/^(?:UTC|[A-Za-z][A-Za-z0-9._+-]*(?:\/[A-Za-z0-9._+-]+)+)$/.test(normalized)
+  ) return '';
+  try {
+    return new Intl.DateTimeFormat('en-US', { timeZone: normalized }).resolvedOptions().timeZone;
+  } catch {
+    return '';
+  }
+}
+
+export function agentLocalDateInTimeZone(timeZone: unknown, nowMs: number) {
+  const normalizedTimeZone = normalizeAgentTimeZone(timeZone);
+  if (!normalizedTimeZone || !Number.isFinite(nowMs)) return '';
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: normalizedTimeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(new Date(nowMs));
+    const year = parts.find((part) => part.type === 'year')?.value ?? '';
+    const month = parts.find((part) => part.type === 'month')?.value ?? '';
+    const day = parts.find((part) => part.type === 'day')?.value ?? '';
+    return /^\d{4}-\d{2}-\d{2}$/.test(`${year}-${month}-${day}`)
+      ? `${year}-${month}-${day}`
+      : '';
+  } catch {
+    return '';
+  }
 }
 
 function validSessionId(value: unknown) {
@@ -511,6 +549,8 @@ async function callArkResponses(
   config: AgentRuntimeConfig,
   fetcher: typeof fetch,
   preferredTool: AgentToolName | null,
+  timeZone: string,
+  referenceDate: string,
 ) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), AGENT_REQUEST_TIMEOUT_MS);
@@ -536,6 +576,10 @@ async function callArkResponses(
           '明确的增、改、删请求必须调用对应 propose_* 工具，只生成待确认提案；查询必须调用 query_applications。',
           '新增公司时，未提供招聘网站传空字符串，不得要求用户先补充。',
           '新增岗位时，未提供的地点、链接和投递日期传空字符串，不得要求用户先补充。',
+          ...(referenceDate ? [
+            `本次请求者的当地时区是 ${timeZone}，当地当前日期是 ${referenceDate}。`,
+            `“今天/今日”必须使用 ${referenceDate}；昨天、明天、前天和后天也必须以该当地日期为基准计算。`,
+          ] : []),
           '修改工具中，未改的新字段传 null。不支持批量写入或直接增删流程记录。',
           '状态必须归一化为工具枚举：“笔试”使用“测评/笔试”，“二面/终面/后续轮次”使用“后续面试”。',
           '绝不得声称操作已完成。真实执行只能由服务器在用户第二次确认后完成。',
@@ -571,6 +615,7 @@ export async function runAgentQuery(options: {
   question: unknown;
   idempotencyKey: unknown;
   sessionId: unknown;
+  timeZone?: unknown;
   now?: () => number;
   fetcher?: typeof fetch;
 }): Promise<AgentQueryResult> {
@@ -580,12 +625,23 @@ export async function runAgentQuery(options: {
   const sessionId = validSessionId(normalizedSessionId) ? normalizedSessionId : '';
   const now = options.now ?? Date.now;
   const nowMs = now();
+  const timeZone = normalizeAgentTimeZone(options.timeZone);
+  const referenceDate = agentLocalDateInTimeZone(timeZone, nowMs);
   const isAdmin = isAgentAdmin(options.principal, options.config.adminChatgptUserId);
   await ensureAgentUser(options.database, options.principal, isAdmin, nowMs);
-  const requestIsValid = Boolean(question && idempotencyKey && sessionId);
+  const basicRequestIsValid = Boolean(question && idempotencyKey && sessionId);
+  const relativeDateContextIsValid = !agentQuestionUsesRelativeDate(question) || Boolean(referenceDate);
+  const requestIsValid = basicRequestIsValid && relativeDateContextIsValid;
   await recordAgentRequestEvent(options.database, options.principal.id, sessionId, requestIsValid, nowMs);
-  if (!requestIsValid) {
+  if (!basicRequestIsValid) {
     return { ok: false, code: 'invalid_request', message: '请输入要分析的问题后再发送。' };
+  }
+  if (!relativeDateContextIsValid) {
+    return {
+      ok: false,
+      code: 'invalid_request',
+      message: '无法读取你当前设备的当地时区，因此没有猜测“今天”的日期，也没有调用模型或扣除次数。请刷新页面后重试，或直接填写 YYYY-MM-DD 格式的明确日期。',
+    };
   }
 
   const before = await getAgentUserStatus(options.database, options.principal, options.config, nowMs);
@@ -637,6 +693,8 @@ export async function runAgentQuery(options: {
       options.config,
       options.fetcher ?? fetch,
       preferredTool,
+      timeZone,
+      referenceDate,
     );
     let responseType: 'answer' | 'clarification' | 'proposal' = 'answer';
     let answer = provider.answer;
@@ -649,6 +707,8 @@ export async function runAgentQuery(options: {
         sessionId,
         toolName: provider.toolCall.name,
         argumentsJson: provider.toolCall.argumentsJson,
+        question,
+        referenceDate,
         now,
       });
       if (preparedAction.kind === 'proposal') {

@@ -2270,6 +2270,12 @@ export default function Home() {
     setAgentActionError('');
     setAgentActionCompleted(null);
     setAgentActionFeedback('idle');
+    let timeZone = '';
+    try {
+      timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+    } catch {
+      // The server will stop relative-date requests safely if the browser cannot expose a time zone.
+    }
     try {
       const response = await fetch('/api/agent/query', {
         method: 'POST',
@@ -2281,6 +2287,7 @@ export default function Home() {
           question,
           idempotencyKey: crypto.randomUUID(),
           sessionId: agentSessionIdRef.current,
+          timeZone,
         }),
       });
       if (response.status === 409) {

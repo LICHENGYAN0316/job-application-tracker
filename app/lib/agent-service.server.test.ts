@@ -6,8 +6,10 @@ import {
   AGENT_MAX_QUESTION_LENGTH,
   AGENT_TECHNICAL_FAILURE_MESSAGE,
   AGENT_WINDOW_MS,
+  agentLocalDateInTimeZone,
   getAgentUserStatus,
   isAgentAdmin,
+  normalizeAgentTimeZone,
   normalizeAgentQuestion,
   parseArkResponse,
   preferredAgentTool,
@@ -328,6 +330,21 @@ test('question normalization accepts 800 characters and rejects longer or non-st
   assert.equal(normalizeAgentQuestion({ question: 'not a string' }), '');
 });
 
+test('requester time zones are strict IANA values and produce the correct local calendar date', () => {
+  const instant = Date.UTC(2026, 7, 31, 16, 30, 0);
+  assert.equal(normalizeAgentTimeZone('Asia/Shanghai'), 'Asia/Shanghai');
+  assert.equal(normalizeAgentTimeZone('Australia/Melbourne'), 'Australia/Melbourne');
+  assert.equal(normalizeAgentTimeZone('UTC'), 'UTC');
+  assert.equal(normalizeAgentTimeZone('CST'), '');
+  assert.equal(normalizeAgentTimeZone('GMT'), '');
+  assert.equal(normalizeAgentTimeZone('Not/A_Real_Zone'), '');
+  assert.equal(normalizeAgentTimeZone(`Asia/Shanghai\u0000`), '');
+  assert.equal(agentLocalDateInTimeZone('Asia/Shanghai', instant), '2026-09-01');
+  assert.equal(agentLocalDateInTimeZone('Australia/Melbourne', instant), '2026-09-01');
+  assert.equal(agentLocalDateInTimeZone('America/Los_Angeles', instant), '2026-08-31');
+  assert.equal(agentLocalDateInTimeZone('CST', instant), '');
+});
+
 test('Ark response parsing extracts answer and safe usage without trusting malformed values', () => {
   assert.deepEqual(parseArkResponse({
     model: 'doubao-test',
@@ -475,6 +492,7 @@ test('explicit CRUD sends one forced tool with a compact prompt instead of the f
     database, principal: ordinaryUser, config: CONFIG,
     question: '帮我添加一个京东的 AI 产品经理岗位',
     idempotencyKey: 'forced-tool-request', sessionId: SESSION_ID, now: () => NOW_MS,
+    timeZone: 'Asia/Shanghai',
     fetcher: (async (_input, init) => {
       body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
       return arkSuccess('模拟服务商未遵守强制工具，仅用于检查请求体。');
@@ -485,6 +503,36 @@ test('explicit CRUD sends one forced tool with a compact prompt instead of the f
   assert.equal(Array.isArray(body.tools) ? body.tools.length : 0, 1);
   assert.equal(body.max_output_tokens, 320);
   assert.doesNotMatch(JSON.stringify(body.input), /不应发送的公司|不应发送的岗位/);
+  assert.match(String(body.instructions), /本次请求者的当地时区是 Asia\/Shanghai/);
+  assert.match(String(body.instructions), new RegExp(agentLocalDateInTimeZone('Asia/Shanghai', NOW_MS)));
+});
+
+test('a relative date without a valid requester time zone stops before the model and quota reservation', async () => {
+  const database = new FakeAgentDatabase();
+  database.globalEnabled = true;
+  let upstreamCalls = 0;
+  const ordinaryUser = { ...CHATGPT_USER, id: 'chatgpt-local-date', subject: 'chatgpt-local-date' };
+  const result = await runAgentQuery({
+    database,
+    principal: ordinaryUser,
+    config: CONFIG,
+    question: '加一个京东的产品经理岗位，投递日期写今天',
+    idempotencyKey: 'missing-time-zone',
+    sessionId: SESSION_ID,
+    timeZone: 'CST',
+    now: () => NOW_MS,
+    fetcher: (async () => {
+      upstreamCalls += 1;
+      return arkSuccess();
+    }) as typeof fetch,
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.code, 'invalid_request');
+    assert.match(result.message, /没有调用模型或扣除次数/);
+  }
+  assert.equal(upstreamCalls, 0);
+  assert.equal(database.calls.length, 0);
 });
 
 test('ordinary-user status and atomic reservation use the current default or per-user override', async () => {

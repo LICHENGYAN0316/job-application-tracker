@@ -47,6 +47,7 @@ export async function POST(request: Request) {
       question: record.question,
       idempotencyKey: record.idempotencyKey,
       sessionId: record.sessionId,
+      timeZone: record.timeZone,
     });
     if (result.ok) return privateJson(result);
     const status = result.code === 'quota_exhausted'

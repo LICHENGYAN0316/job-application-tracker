@@ -433,6 +433,133 @@ function validDate(value: string) {
   return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
 }
 
+const RELATIVE_DATE_OFFSETS: Record<string, number> = {
+  前天: -2,
+  昨天: -1,
+  昨日: -1,
+  今天: 0,
+  今日: 0,
+  当天: 0,
+  明天: 1,
+  明日: 1,
+  后天: 2,
+};
+
+const RELATIVE_DATE_WORDS = '(?:前天|昨天|昨日|今天|今日(?!头条)|当天|明天|明日|后天)';
+const APPLICATION_DATE_CONTEXT = '(?:投递日期|申请日期|投递|申请|投了|投的)';
+const NEXT_DATE_CONTEXT = '(?:下一步日期|下一次日期|提醒日期|安排日期|面试日期|笔试日期|下一步|提醒|安排|面试|笔试)';
+
+function compactQuestion(value: unknown) {
+  return boundedString(value, 800).replace(/\s+/g, '');
+}
+
+function relativeDateWordNearContext(question: string, context: string) {
+  const match = new RegExp(
+    `(?:${context}).{0,12}(${RELATIVE_DATE_WORDS})|(${RELATIVE_DATE_WORDS}).{0,12}(?:${context})`,
+  ).exec(question);
+  return match?.[1] ?? match?.[2] ?? '';
+}
+
+export function agentQuestionUsesRelativeDate(value: unknown) {
+  const question = compactQuestion(value);
+  return Boolean(
+    relativeDateWordNearContext(question, APPLICATION_DATE_CONTEXT)
+    || relativeDateWordNearContext(question, NEXT_DATE_CONTEXT),
+  );
+}
+
+function hasDateContext(question: string, context: string) {
+  return new RegExp(context).test(question);
+}
+
+function explicitIsoDateNearContext(question: string, context: string) {
+  const match = new RegExp(
+    `(?:${context}).{0,12}(\\d{4}-\\d{2}-\\d{2})|(\\d{4}-\\d{2}-\\d{2}).{0,12}(?:${context})`,
+  ).exec(question);
+  return match?.[1] ?? match?.[2] ?? '';
+}
+
+function requestsEmptyDate(question: string, context: string) {
+  return new RegExp(
+    `(?:${context}).{0,12}(?:未填(?:写)?|不填|留空|空着|没有|无)|(?:未填(?:写)?|不填|留空|空着|没有|无).{0,12}(?:${context})`,
+  ).test(question);
+}
+
+function addCalendarDays(referenceDate: string, amount: number) {
+  const [year, month, day] = referenceDate.split('-').map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  date.setUTCDate(date.getUTCDate() + amount);
+  return date.toISOString().slice(0, 10);
+}
+
+function relativeDateFromQuestion(question: string, context: string, referenceDate: string) {
+  const word = relativeDateWordNearContext(question, context);
+  if (!word) return { matched: false as const, value: '' };
+  if (!referenceDate || !validDate(referenceDate)) {
+    return { matched: true as const, value: '', invalidReferenceDate: true as const };
+  }
+  return {
+    matched: true as const,
+    value: addCalendarDays(referenceDate, RELATIVE_DATE_OFFSETS[word] ?? 0),
+  };
+}
+
+function normalizeRelativeToolDates(options: {
+  toolName: string;
+  argumentsRecord: Record<string, unknown>;
+  question: unknown;
+  referenceDate: unknown;
+}) {
+  if (options.toolName !== 'propose_add_job' && options.toolName !== 'propose_update_job') {
+    return { ok: true as const, argumentsRecord: options.argumentsRecord };
+  }
+  const question = compactQuestion(options.question);
+  const referenceDate = boundedString(options.referenceDate, 10);
+  const argumentsRecord = { ...options.argumentsRecord };
+
+  if (requestsEmptyDate(question, APPLICATION_DATE_CONTEXT)) {
+    argumentsRecord.appliedAt = '';
+  } else {
+    const appliedAt = relativeDateFromQuestion(question, APPLICATION_DATE_CONTEXT, referenceDate);
+    if (appliedAt.matched && 'invalidReferenceDate' in appliedAt) {
+      return { ok: false as const };
+    }
+    if (appliedAt.matched) {
+      argumentsRecord.appliedAt = appliedAt.value;
+    } else {
+      const explicitDate = explicitIsoDateNearContext(question, APPLICATION_DATE_CONTEXT);
+      if (explicitDate) {
+        argumentsRecord.appliedAt = explicitDate;
+      } else if (!hasDateContext(question, APPLICATION_DATE_CONTEXT)) {
+        argumentsRecord.appliedAt = options.toolName === 'propose_update_job' ? null : '';
+      }
+    }
+  }
+
+  if (options.toolName === 'propose_update_job') {
+    if (requestsEmptyDate(question, NEXT_DATE_CONTEXT)) {
+      argumentsRecord.nextDate = '';
+    } else {
+      const nextDate = relativeDateFromQuestion(question, NEXT_DATE_CONTEXT, referenceDate);
+      if (nextDate.matched && 'invalidReferenceDate' in nextDate) {
+        return { ok: false as const };
+      }
+      if (nextDate.matched) {
+        argumentsRecord.nextDate = nextDate.value;
+      } else {
+        const explicitDate = explicitIsoDateNearContext(question, NEXT_DATE_CONTEXT);
+        if (explicitDate) {
+          argumentsRecord.nextDate = explicitDate;
+        } else if (!hasDateContext(question, NEXT_DATE_CONTEXT)) {
+          argumentsRecord.nextDate = null;
+        }
+      }
+    }
+  }
+
+  return { ok: true as const, argumentsRecord };
+}
+
 export function parseAgentActionToolCall(value: unknown): ParsedActionResult {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return { ok: false, message: '操作提案格式不完整，本次没有修改数据。' };
@@ -1214,6 +1341,8 @@ export async function prepareAgentActionFromToolCall(options: {
   sessionId: unknown;
   toolName: unknown;
   argumentsJson: unknown;
+  question?: unknown;
+  referenceDate?: unknown;
   now?: () => number;
 }): Promise<PreparedAgentActionResult> {
   const nowMs = (options.now ?? Date.now)();
@@ -1282,6 +1411,31 @@ export async function prepareAgentActionFromToolCall(options: {
     });
     return { kind: 'clarification', message: '操作参数不完整，请补充后再试；本次没有修改数据。' };
   }
+  const normalizedDates = normalizeRelativeToolDates({
+    toolName,
+    argumentsRecord,
+    question: options.question,
+    referenceDate: options.referenceDate,
+  });
+  if (!normalizedDates.ok) {
+    await recordEvent(options.database, {
+      id: crypto.randomUUID(),
+      accountKey: options.principal.id,
+      sessionId: boundedString(options.sessionId, 100),
+      actionKind,
+      eventType: 'clarification_required',
+      reasonCode: 'local_timezone_required',
+      schemaValid: true,
+      ambiguityDetected: true,
+      ambiguityHandled: true,
+      nowMs,
+    });
+    return {
+      kind: 'clarification',
+      message: '无法确认你当地的日期，本次没有修改数据。请刷新页面后重试，或直接填写 YYYY-MM-DD 格式的明确日期。',
+    };
+  }
+  argumentsRecord = normalizedDates.argumentsRecord;
   if (actionKind === 'add_job') {
     argumentsRecord = {
       ...argumentsRecord,
