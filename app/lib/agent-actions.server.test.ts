@@ -3,12 +3,14 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import {
   AGENT_ACTION_PROPOSAL_TTL_MS,
+  agentQuestionAsksRecentActionOutcome,
   cancelAgentAction,
   confirmAgentAction,
   createAgentActionProposal,
   ensureAgentActionSchema,
   parseAgentActionToolCall,
   prepareAgentActionFromToolCall,
+  readLatestAgentActionOutcome,
   recordAgentActionFeedback,
   type AgentActionDatabase,
   type AgentActionStatement,
@@ -118,6 +120,38 @@ function makeCompany(id: string, name: string, jobs = [makeJob(`${id}-job`, '产
 
 function baseState() {
   return { companies: [makeCompany('company-a', '星河能源')] };
+}
+
+const ANONYMOUS_COMPANY_JOB_COUNTS = [3, 3, 3, 2, 2, 2, 2, 2, 2] as const;
+const ANONYMOUS_MISSING_DATE_INDEXES = new Set([1, 4, 7, 10, 13, 16, 19]);
+
+function anonymousTwentyOneJobState() {
+  let jobIndex = 0;
+  const companies = ANONYMOUS_COMPANY_JOB_COUNTS.map((jobCount, companyIndex) => {
+    const jobs = Array.from({ length: jobCount }, () => {
+      jobIndex += 1;
+      const job = makeJob(
+        `anonymous-job-${String(jobIndex).padStart(2, '0')}`,
+        `匿名样本岗位-${String(jobIndex).padStart(2, '0')}`,
+        `匿名地点-${String((jobIndex % 3) + 1).padStart(2, '0')}`,
+      );
+      job.stage = jobIndex <= 15
+        ? '已投递'
+        : jobIndex <= 17
+          ? '测评/笔试'
+          : jobIndex <= 20
+            ? '进入人才库'
+            : '被拒';
+      job.appliedAt = ANONYMOUS_MISSING_DATE_INDEXES.has(jobIndex) ? '' : '2026-08-31';
+      return job;
+    });
+    return makeCompany(
+      `anonymous-company-${String(companyIndex + 1).padStart(2, '0')}`,
+      `匿名样本公司-${String(companyIndex + 1).padStart(2, '0')}`,
+      jobs,
+    );
+  });
+  return { companies };
 }
 
 async function emptyDatabase() {
@@ -666,6 +700,200 @@ test('company and job updates remain proposals until confirmation and preserve u
   assert.equal(job.notes, 'private note that must never enter action telemetry');
 });
 
+test('live QA update wording resolves the stored company and job and repairs incomplete model arguments', async (t) => {
+  const qaJob = makeJob('qa-job', 'QA-100次测试-AI产品经理', '');
+  const qaCompany = makeCompany('qa-company', 'QA-100次测试公司-A', [qaJob]);
+  const database = await databaseWithState({ companies: [qaCompany] });
+  t.after(() => database.close());
+  const sessionId = crypto.randomUUID();
+
+  const cases = [
+    {
+      question: '把 QA-100次测试-AI产品经理 改成二面',
+      arguments: { companyName: 'QA', title: '100次测试-AI产品经理', stage: '后续面试' },
+      expected: ['招聘流程', '后续面试'],
+    },
+    {
+      question: '把 QA-100次测试-AI产品经理 的优先级改成高',
+      arguments: { companyName: 'QA', title: 'AI产品经理', priority: '高' },
+      expected: ['优先级', '高'],
+    },
+    {
+      question: '把 QA-100次测试-AI产品经理 的下一步改成准备作品集，日期 2026-09-05',
+      arguments: { companyName: 'QA', title: 'AI产品经理', nextAction: '准备作品集' },
+      expected: ['下一步行动', '准备作品集', '下一步日期', '2026-09-05'],
+    },
+    {
+      question: '把 QA-100次测试-AI产品经理 的岗位名称改成 AI产品经理-新',
+      arguments: { companyName: 'QA', title: 'AI产品经理', newTitle: 'AI产品经理' },
+      expected: ['岗位名称', 'AI产品经理-新'],
+    },
+    {
+      question: '把 QA-100次测试-AI产品经理 的岗位链接改成 https://example.com/qa-job',
+      arguments: { companyName: 'QA', title: 'AI产品经理' },
+      expected: ['岗位链接', 'https://example.com/qa-job'],
+    },
+    {
+      question: '把 QA-100次测试-AI产品经理 的投递日期改成 2026-09-03',
+      arguments: { companyName: 'QA', title: 'AI产品经理' },
+      expected: ['投递日期', '2026-09-03'],
+    },
+    {
+      question: '把 QA-100次测试-AI产品经理 的投递日期改成 2026-09-03，下一步日期改成 2026-09-05',
+      arguments: {
+        companyName: 'QA', title: 'AI产品经理',
+        appliedAt: '2026-09-05', nextDate: '2026-09-03',
+      },
+      expected: ['投递日期：.*2026-09-03', '下一步日期：.*2026-09-05'],
+      absent: ['下一步行动'],
+    },
+  ];
+
+  for (const item of cases) {
+    const result = await prepareAgentActionFromToolCall({
+      database, principal: USER_A, sourceCallId: crypto.randomUUID(), sessionId,
+      toolName: 'propose_update_job', argumentsJson: JSON.stringify(item.arguments),
+      question: item.question, referenceDate: '2026-09-01', now: () => NOW,
+    });
+    assert.equal(result.kind, 'proposal', item.question);
+    if (result.kind !== 'proposal') continue;
+    assert.equal(result.proposal.actionKind, 'update_job');
+    assert.equal(result.proposal.title, '修改岗位');
+    const preview = result.proposal.details.map((detail) => `${detail.label}：${detail.value}`).join('\n');
+    for (const expected of item.expected) assert.match(preview, new RegExp(expected));
+    if ('absent' in item) {
+      for (const absent of item.absent) assert.doesNotMatch(preview, new RegExp(absent));
+    }
+  }
+});
+
+test('a fully mentioned unique job safely resolves its company, while duplicate titles require clarification', async (t) => {
+  const uniqueJob = makeJob('unique-job', 'QA-100次测试-AI产品经理', '');
+  const uniqueCompany = makeCompany('unique-company', 'QA-100次测试公司-A', [uniqueJob]);
+  const database = await databaseWithState({ companies: [uniqueCompany] });
+  t.after(() => database.close());
+
+  const unique = await prepareAgentActionFromToolCall({
+    database, principal: USER_A, sourceCallId: crypto.randomUUID(), sessionId: crypto.randomUUID(),
+    toolName: 'propose_update_job',
+    argumentsJson: JSON.stringify({ companyName: 'QA', title: '100次测试-AI产品经理', priority: '高' }),
+    question: '把 QA-100次测试-AI产品经理 的优先级改成高',
+    now: () => NOW,
+  });
+  assert.equal(unique.kind, 'proposal');
+  if (unique.kind === 'proposal') {
+    assert.match(unique.proposal.summary, /QA-100次测试公司-A/);
+    assert.match(unique.proposal.summary, /QA-100次测试-AI产品经理/);
+  }
+
+  const ambiguousDatabase = await databaseWithState({
+    companies: [
+      makeCompany('company-a', '候选公司-A', [makeJob('duplicate-a', '共用-AI产品经理', '')]),
+      makeCompany('company-b', '候选公司-B', [makeJob('duplicate-b', '共用-AI产品经理', '')]),
+    ],
+  });
+  t.after(() => ambiguousDatabase.close());
+  const ambiguous = await prepareAgentActionFromToolCall({
+    database: ambiguousDatabase,
+    principal: USER_A,
+    sourceCallId: crypto.randomUUID(),
+    sessionId: crypto.randomUUID(),
+    toolName: 'propose_update_job',
+    argumentsJson: JSON.stringify({
+      companyName: '候选公司-A', title: '共用-AI产品经理', priority: '高',
+    }),
+    question: '把共用-AI产品经理的优先级改成高',
+    now: () => NOW,
+  });
+  assert.equal(ambiguous.kind, 'clarification');
+  if (ambiguous.kind === 'clarification') {
+    assert.match(ambiguous.message, /多个同名岗位/);
+    assert.deepEqual(ambiguous.candidates?.map((candidate) => candidate.label), [
+      '候选公司-A · 共用-AI产品经理',
+      '候选公司-B · 共用-AI产品经理',
+    ]);
+  }
+  const proposals = ambiguousDatabase.sqlite.prepare(
+    'SELECT COUNT(*) AS count FROM agent_action_proposals',
+  ).get() as { count: number };
+  assert.equal(Number(proposals.count), 0);
+});
+
+test('live QA company rename and invalid stage wording produce the right safe outcome', async (t) => {
+  const qaJob = makeJob('qa-job', 'AI产品经理', '');
+  const qaCompany = makeCompany('qa-company', 'QA-100次测试空网站公司', [qaJob]);
+  const database = await databaseWithState({ companies: [qaCompany] });
+  t.after(() => database.close());
+
+  const renamed = await prepareAgentActionFromToolCall({
+    database, principal: USER_A, sourceCallId: crypto.randomUUID(), sessionId: crypto.randomUUID(),
+    toolName: 'propose_update_company', argumentsJson: JSON.stringify({ companyName: 'QA' }),
+    question: '把 QA-100次测试空网站公司 改名为 QA-100次测试新公司', now: () => NOW,
+  });
+  assert.equal(renamed.kind, 'proposal');
+  if (renamed.kind === 'proposal') {
+    assert.equal(renamed.proposal.actionKind, 'update_company');
+    assert.match(renamed.proposal.details[0].value, /QA-100次测试新公司/);
+  }
+
+  const invalidStage = await prepareAgentActionFromToolCall({
+    database, principal: USER_A, sourceCallId: crypto.randomUUID(), sessionId: crypto.randomUUID(),
+    toolName: 'propose_update_job', argumentsJson: JSON.stringify({ companyName: 'QA', title: 'AI产品经理' }),
+    question: '把 QA-100次测试空网站公司-AI产品经理 的状态改成还行吧', now: () => NOW,
+  });
+  assert.equal(invalidStage.kind, 'clarification');
+  if (invalidStage.kind === 'clarification') {
+    assert.match(invalidStage.message, /不是可用的招聘流程/);
+    assert.match(invalidStage.message, /已投递/);
+    assert.doesNotMatch(invalidStage.message, /没有找到名为“QA”/);
+  }
+});
+
+test('existence queries recover exact QA entities and a cancelled proposal remains queryable as cancelled', async (t) => {
+  const qaJob = makeJob('qa-job', 'AI产品经理', '');
+  const qaCompany = makeCompany('qa-company', 'QA-100次测试空网站公司', [qaJob]);
+  const database = await databaseWithState({ companies: [qaCompany] });
+  t.after(() => database.close());
+  const sessionId = crypto.randomUUID();
+  const proposal = await createAgentActionProposal({
+    database, principal: USER_A, sessionId, sourceCallId: crypto.randomUUID(),
+    idempotencyKey: crypto.randomUUID(), confirmationNonce: crypto.randomUUID(),
+    toolCall: {
+      kind: 'update_job', companyName: qaCompany.name, title: qaJob.title, location: '',
+      newTitle: null, newLocation: null, portalUrl: null, appliedAt: null,
+      stage: null, priority: '高', nextAction: null, nextDate: null,
+    },
+    dependencies: { now: () => NOW },
+  });
+  assert.equal(proposal.ok, true);
+  if (!proposal.ok) return;
+  await cancelAgentAction({
+    database, principal: USER_A, actionId: proposal.proposal.id,
+    confirmationNonce: proposal.proposal.confirmationNonce, dependencies: { now: () => NOW + 1 },
+  });
+
+  assert.equal(agentQuestionAsksRecentActionOutcome('刚才的公司和岗位创建了吗？'), true);
+  assert.match(await readLatestAgentActionOutcome(database, USER_A.id, sessionId), /已取消，没有修改/);
+
+  const companyQuery = await prepareAgentActionFromToolCall({
+    database, principal: USER_A, sourceCallId: crypto.randomUUID(), sessionId,
+    toolName: 'query_applications',
+    argumentsJson: JSON.stringify({ companyName: 'QA', title: '100次测试空网站公司', location: '', stage: '' }),
+    question: 'QA-100次测试空网站公司是否创建成功', now: () => NOW + 2,
+  });
+  assert.equal(companyQuery.kind, 'read');
+  if (companyQuery.kind === 'read') assert.match(companyQuery.message, /QA-100次测试空网站公司/);
+
+  const jobQuery = await prepareAgentActionFromToolCall({
+    database, principal: USER_A, sourceCallId: crypto.randomUUID(), sessionId,
+    toolName: 'query_applications',
+    argumentsJson: JSON.stringify({ companyName: 'QA', title: '100次测试-AI产品经理', location: '', stage: '' }),
+    question: '查询 QA-100次测试空网站公司-AI产品经理 是否存在', now: () => NOW + 3,
+  });
+  assert.equal(jobQuery.kind, 'read');
+  if (jobQuery.kind === 'read') assert.match(jobQuery.message, /AI产品经理/);
+});
+
 test('query tool reads only the authenticated account and never creates a proposal or mutation', async (t) => {
   const database = await databaseWithState();
   t.after(() => database.close());
@@ -673,7 +901,8 @@ test('query tool reads only the authenticated account and never creates a propos
   const result = await prepareAgentActionFromToolCall({
     database, principal: USER_A, sourceCallId: crypto.randomUUID(), sessionId: crypto.randomUUID(),
     toolName: 'query_applications',
-    argumentsJson: JSON.stringify({ companyName: '星河', title: '产品', location: '', stage: '' }),
+    argumentsJson: JSON.stringify({ companyName: '星河能源', title: '产品', location: '', stage: '', appliedAt: '' }),
+    question: '查看星河能源中名称包含产品的岗位',
     now: () => NOW,
   });
   assert.equal(result.kind, 'read');
@@ -684,6 +913,187 @@ test('query tool reads only the authenticated account and never creates a propos
   assert.equal(Number(proposals.count), 0);
   const telemetry = JSON.stringify(database.sqlite.prepare('SELECT * FROM agent_action_events').all());
   assert.equal(telemetry.includes('星河能源'), false);
+});
+
+test('anonymous 9-company fixture lists all 21 jobs and reports the exact 15/2/3/1 stage distribution', async (t) => {
+  const state = anonymousTwentyOneJobState();
+  const database = await databaseWithState(state);
+  t.after(() => database.close());
+  const result = await prepareAgentActionFromToolCall({
+    database, principal: USER_A, sourceCallId: crypto.randomUUID(), sessionId: crypto.randomUUID(),
+    toolName: 'query_applications',
+    argumentsJson: JSON.stringify({ companyName: '', title: '', location: '', stage: '', appliedAt: '' }),
+    question: '列出全部岗位并汇总阶段分布',
+    now: () => NOW,
+  });
+  assert.equal(result.kind, 'read');
+  if (result.kind !== 'read') return;
+  assert.match(result.message, /找到 21 个/);
+  assert.match(result.message, /已投递 15/);
+  assert.match(result.message, /测评\/笔试 2/);
+  assert.match(result.message, /进入人才库 3/);
+  assert.match(result.message, /被拒 1/);
+  for (const company of state.companies) {
+    assert.match(result.message, new RegExp(company.name));
+    for (const job of company.jobs) assert.match(result.message, new RegExp(job.title));
+  }
+  assert.doesNotMatch(result.message, /未展开/);
+});
+
+test('anonymous 9-company fixture returns exactly the 7 jobs with an unfilled application date', async (t) => {
+  const state = anonymousTwentyOneJobState();
+  const database = await databaseWithState(state);
+  t.after(() => database.close());
+  const result = await prepareAgentActionFromToolCall({
+    database, principal: USER_A, sourceCallId: crypto.randomUUID(), sessionId: crypto.randomUUID(),
+    toolName: 'query_applications',
+    argumentsJson: JSON.stringify({ companyName: '', title: '', location: '', stage: '', appliedAt: '' }),
+    question: '哪些岗位没写投递日期',
+    now: () => NOW,
+  });
+  assert.equal(result.kind, 'read');
+  if (result.kind !== 'read') return;
+  assert.match(result.message, /找到 7 个/);
+  const jobs = state.companies.flatMap((company) => company.jobs);
+  for (const job of jobs) {
+    if (job.appliedAt) {
+      assert.doesNotMatch(result.message, new RegExp(job.title));
+    } else {
+      assert.match(result.message, new RegExp(job.title));
+    }
+  }
+});
+
+test('confirming one anonymous QA field update preserves every other field across all 21 jobs', async (t) => {
+  const initialState = anonymousTwentyOneJobState();
+  const before = structuredClone(initialState);
+  const targetCompany = initialState.companies[0];
+  const targetJob = targetCompany.jobs[0];
+  const database = await databaseWithState(initialState);
+  t.after(() => database.close());
+
+  const prepared = await prepareAgentActionFromToolCall({
+    database,
+    principal: USER_A,
+    sourceCallId: crypto.randomUUID(),
+    sessionId: crypto.randomUUID(),
+    toolName: 'propose_update_job',
+    argumentsJson: JSON.stringify({
+      companyName: '模型误判公司',
+      title: '模型截断岗位',
+      priority: '高',
+    }),
+    question: `把 ${targetJob.title} 的优先级改成高`,
+    now: () => NOW,
+  });
+  assert.equal(prepared.kind, 'proposal');
+  if (prepared.kind !== 'proposal') return;
+  assert.match(prepared.proposal.summary, new RegExp(targetCompany.name));
+  assert.match(prepared.proposal.summary, new RegExp(targetJob.title));
+
+  const confirmed = await confirmAgentAction({
+    database,
+    principal: USER_A,
+    actionId: prepared.proposal.id,
+    confirmationNonce: prepared.proposal.confirmationNonce,
+    requestId: crypto.randomUUID(),
+    dependencies: { now: () => NOW + 1 },
+  });
+  assert.equal(confirmed.ok, true);
+  if (!confirmed.ok) return;
+
+  const expected = structuredClone(before);
+  expected.companies[0].jobs[0].priority = '高';
+  assert.deepEqual(confirmed.state, expected);
+  assert.deepEqual(stateFor(database)?.state, expected);
+  assert.equal(expected.companies.length, 9);
+  assert.equal(expected.companies.flatMap((company) => company.jobs).length, 21);
+});
+
+test('read query resolves a month-day application date in the requester local year', async (t) => {
+  const currentYear = makeJob('current-year', '本年岗位', '北京') as ReturnType<typeof makeJob> & { appliedAt?: string };
+  currentYear.appliedAt = '2026-09-03';
+  const previousYear = makeJob('previous-year', '往年岗位', '北京') as ReturnType<typeof makeJob> & { appliedAt?: string };
+  previousYear.appliedAt = '2025-09-03';
+  const database = await databaseWithState({
+    companies: [makeCompany('dates', '日期测试公司', [currentYear, previousYear])],
+  });
+  t.after(() => database.close());
+  const result = await prepareAgentActionFromToolCall({
+    database, principal: USER_A, sourceCallId: crypto.randomUUID(), sessionId: crypto.randomUUID(),
+    toolName: 'query_applications',
+    argumentsJson: JSON.stringify({ companyName: '', title: '', location: '', stage: '', appliedAt: '' }),
+    question: '查找 9月3日投递的岗位',
+    referenceDate: '2026-09-01',
+    now: () => NOW,
+  });
+  assert.equal(result.kind, 'read');
+  if (result.kind !== 'read') return;
+  assert.match(result.message, /找到 1 个/);
+  assert.match(result.message, /本年岗位/);
+  assert.doesNotMatch(result.message, /往年岗位/);
+});
+
+test('company target repair preserves stage filters from the controlled query tool', async (t) => {
+  const applied = makeJob('applied', '已投递岗位', '北京');
+  applied.stage = '已投递';
+  const rejected = makeJob('rejected', '被拒岗位', '北京');
+  rejected.stage = '被拒';
+  const database = await databaseWithState({
+    companies: [makeCompany('jd', '京东', [applied, rejected])],
+  });
+  t.after(() => database.close());
+  const result = await prepareAgentActionFromToolCall({
+    database, principal: USER_A, sourceCallId: crypto.randomUUID(), sessionId: crypto.randomUUID(),
+    toolName: 'query_applications',
+    argumentsJson: JSON.stringify({
+      companyName: '京', title: '', location: '', stage: '已投递', appliedAt: '',
+    }),
+    question: '查看京东已投岗位',
+    now: () => NOW,
+  });
+  assert.equal(result.kind, 'read');
+  if (result.kind !== 'read') return;
+  assert.match(result.message, /找到 1 个/);
+  assert.match(result.message, /已投递岗位/);
+  assert.doesNotMatch(result.message, /被拒岗位/);
+});
+
+test('read query uses exact mentioned entities and compares two requested jobs', async (t) => {
+  const first = makeCompany('first', '甲方能源', [makeJob('first-job', '甲方产品经理', '杭州')]);
+  const second = makeCompany('second', '乙方电气', [makeJob('second-job', '乙方解决方案工程师', '南京')]);
+  const similarlyNamed = makeCompany('similar', '甲方能源科技', [makeJob('similar-job', '不应误命中岗位', '北京')]);
+  const empty = makeCompany('empty', 'QA-100次测试空网站公司', []);
+  const database = await databaseWithState({ companies: [first, second, similarlyNamed, empty] });
+  t.after(() => database.close());
+
+  const compare = await prepareAgentActionFromToolCall({
+    database, principal: USER_A, sourceCallId: crypto.randomUUID(), sessionId: crypto.randomUUID(),
+    toolName: 'query_applications',
+    argumentsJson: JSON.stringify({ companyName: '', title: '', location: '', stage: '', appliedAt: '' }),
+    question: '对比甲方能源的甲方产品经理和乙方电气的乙方解决方案工程师',
+    now: () => NOW,
+  });
+  assert.equal(compare.kind, 'read');
+  if (compare.kind === 'read') {
+    assert.match(compare.message, /对比找到 2 个/);
+    assert.match(compare.message, /甲方产品经理/);
+    assert.match(compare.message, /乙方解决方案工程师/);
+    assert.doesNotMatch(compare.message, /不应误命中岗位/);
+  }
+
+  const exactEmpty = await prepareAgentActionFromToolCall({
+    database, principal: USER_A, sourceCallId: crypto.randomUUID(), sessionId: crypto.randomUUID(),
+    toolName: 'query_applications',
+    argumentsJson: JSON.stringify({ companyName: '', title: '', location: '', stage: '', appliedAt: '' }),
+    question: '精确查看 QA-100次测试空网站公司',
+    now: () => NOW,
+  });
+  assert.equal(exactEmpty.kind, 'read');
+  if (exactEmpty.kind === 'read') {
+    assert.match(exactEmpty.message, /当前还没有岗位记录/);
+    assert.doesNotMatch(exactEmpty.message, /甲方产品经理/);
+  }
 });
 
 test('deletes a company and its jobs only after valid confirmation', async (t) => {
@@ -911,6 +1321,33 @@ test('cancellation is idempotent and prevents later execution', async (t) => {
   });
   assert.equal(confirm.ok, false);
   if (!confirm.ok) assert.equal(confirm.code, 'cancelled');
+  assert.equal(stateFor(database)?.state.companies.length, 1);
+});
+
+test('a safely cancelled proposal can be marked incorrect for quality feedback', async (t) => {
+  const database = await databaseWithState();
+  t.after(() => database.close());
+  const proposal = await propose(database, { kind: 'delete_company', companyName: '星河能源' });
+  assert.equal(proposal.ok, true);
+  if (!proposal.ok) return;
+  const cancelled = await cancelAgentAction({
+    database, principal: USER_A, actionId: proposal.proposal.id,
+    confirmationNonce: proposal.proposal.confirmationNonce, dependencies: { now: () => NOW + 1 },
+  });
+  assert.equal(cancelled.ok, true);
+  assert.equal(await recordAgentActionFeedback({
+    database, principal: USER_A, actionId: proposal.proposal.id,
+    outcome: 'incorrect', now: () => NOW + 2,
+  }), true);
+  assert.equal(await recordAgentActionFeedback({
+    database, principal: USER_A, actionId: proposal.proposal.id,
+    outcome: 'correct', now: () => NOW + 3,
+  }), false);
+  const row = database.sqlite.prepare(
+    'SELECT status, feedback FROM agent_action_proposals WHERE id = ?',
+  ).get(proposal.proposal.id) as { status: string; feedback: string };
+  assert.equal(row.status, 'cancelled');
+  assert.equal(row.feedback, 'incorrect');
   assert.equal(stateFor(database)?.state.companies.length, 1);
 });
 

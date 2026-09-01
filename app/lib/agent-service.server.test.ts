@@ -6,14 +6,18 @@ import {
   AGENT_MAX_QUESTION_LENGTH,
   AGENT_TECHNICAL_FAILURE_MESSAGE,
   AGENT_WINDOW_MS,
+  agentLocalDateFromOffset,
   agentLocalDateInTimeZone,
+  agentQuestionUsesCareerContext,
   getAgentUserStatus,
   isAgentAdmin,
   normalizeAgentTimeZone,
+  normalizeAgentTimeZoneOffset,
   normalizeAgentQuestion,
   parseArkResponse,
   preferredAgentTool,
   recordAgentFeedback,
+  resolveAgentRequesterDate,
   runAgentQuery,
   type AgentDatabase,
   type AgentRuntimeConfig,
@@ -50,6 +54,14 @@ type AgentCallRow = {
   errorClass: string | null;
 };
 
+type AgentActionProposalRow = {
+  accountKey: string;
+  sessionId: string;
+  actionKind: 'add_company' | 'add_job' | 'add_company_job' | 'update_company' | 'update_job' | 'delete_company' | 'delete_job';
+  status: 'awaiting_confirmation' | 'executing' | 'executed' | 'cancelled' | 'expired' | 'conflict' | 'failed';
+  createdAtMs: number;
+};
+
 class FakeStatement {
   private values: unknown[] = [];
   private readonly query: string;
@@ -66,6 +78,18 @@ class FakeStatement {
   }
 
   async first<T>() {
+    if (/FROM\s+agent_action_proposals/i.test(this.query)) {
+      const accountKey = String(this.values[0]);
+      const cutoffMs = Number(this.values[1]);
+      const row = this.database.actionProposals
+        .filter((proposal) => proposal.accountKey === accountKey && proposal.createdAtMs >= cutoffMs)
+        .sort((first, second) => second.createdAtMs - first.createdAtMs)[0];
+      return (row ? { action_kind: row.actionKind, status: row.status } : null) as T | null;
+    }
+    if (/SELECT\s+version,\s*deleted_at\s+FROM\s+application_states/i.test(this.query)) {
+      const version = this.database.applicationStateVersions.get(String(this.values[0]));
+      return (version === undefined ? null : { version, deleted_at: null }) as T | null;
+    }
     if (/SELECT\s+data_json\s+FROM\s+application_states/i.test(this.query)) {
       const dataJson = this.database.applicationStates.get(String(this.values[0]));
       return (dataJson === undefined ? null : { data_json: dataJson }) as T | null;
@@ -232,7 +256,9 @@ class FakeStatement {
       const call = this.database.calls.find((candidate) => (
         candidate.id === String(id) && candidate.accountKey === String(accountKey)
       ));
-      if (!call || call.status !== 'success' || call.feedback !== null) return { meta: { changes: 0 } };
+      if (!call || !['success', 'technical_failure'].includes(call.status) || call.feedback !== null) {
+        return { meta: { changes: 0 } };
+      }
       call.feedback = feedback as AgentCallRow['feedback'];
       return { meta: { changes: 1 } };
     }
@@ -246,7 +272,9 @@ class FakeAgentDatabase {
   defaultLimit = AGENT_DAILY_LIMIT;
   readonly users = new Map<string, AgentUserRow>();
   readonly calls: AgentCallRow[] = [];
+  readonly actionProposals: AgentActionProposalRow[] = [];
   readonly applicationStates = new Map<string, string>();
+  readonly applicationStateVersions = new Map<string, string>();
 
   prepare(query: string) {
     return new FakeStatement(query, this) as unknown as ReturnType<AgentDatabase['prepare']>;
@@ -343,6 +371,20 @@ test('requester time zones are strict IANA values and produce the correct local 
   assert.equal(agentLocalDateInTimeZone('Australia/Melbourne', instant), '2026-09-01');
   assert.equal(agentLocalDateInTimeZone('America/Los_Angeles', instant), '2026-08-31');
   assert.equal(agentLocalDateInTimeZone('CST', instant), '');
+  assert.equal(normalizeAgentTimeZoneOffset(-480), -480);
+  assert.equal(normalizeAgentTimeZoneOffset(-841), null);
+  assert.equal(normalizeAgentTimeZoneOffset('480'), null);
+  assert.equal(agentLocalDateFromOffset(-480, instant), '2026-09-01');
+  assert.equal(agentLocalDateFromOffset(420, instant), '2026-08-31');
+  assert.deepEqual(resolveAgentRequesterDate({
+    timeZone: 'CST', timeZoneOffsetMinutes: -480, nowMs: instant,
+  }), { referenceDate: '2026-09-01', timeZoneLabel: 'UTC+08:00' });
+});
+
+test('career context classification includes planning and interview preparation but excludes weather', () => {
+  assert.equal(agentQuestionUsesCareerContext('基于现有数据给我前三个优先建议'), true);
+  assert.equal(agentQuestionUsesCareerContext('帮我做一次通用面试准备'), true);
+  assert.equal(agentQuestionUsesCareerContext('墨尔本今天天气怎么样？'), false);
 });
 
 test('Ark response parsing extracts answer and safe usage without trusting malformed values', () => {
@@ -372,6 +414,23 @@ test('high-confidence CRUD and read requests select one controlled tool', () => 
   assert.equal(preferredAgentTool('把这个岗位的状态改为一面'), 'propose_update_job');
   assert.equal(preferredAgentTool('删除这家公司'), 'propose_delete_company');
   assert.equal(preferredAgentTool('我下一步应该做什么？'), null);
+  assert.equal(preferredAgentTool('刚才的公司和岗位创建了吗？'), null);
+  assert.equal(preferredAgentTool('京东公司是否创建成功'), 'query_applications');
+  assert.equal(preferredAgentTool('查看公司记录'), 'query_applications');
+  assert.equal(preferredAgentTool('查看新增的岗位'), 'query_applications');
+  assert.equal(preferredAgentTool('QA-100次测试空网站公司是否创建成功'), 'query_applications');
+  assert.equal(preferredAgentTool('把 QA-100次测试-AI产品经理 的优先级改成高'), 'propose_update_job');
+  assert.equal(preferredAgentTool('把 QA-100次测试-AI产品经理 改成二面'), 'propose_update_job');
+  assert.equal(preferredAgentTool('把 QA-100次测试-AI产品经理 的下一步改成准备作品集，日期 2026-09-05'), 'propose_update_job');
+  assert.equal(preferredAgentTool('把 QA-100次测试空网站公司 改名为 QA-100次测试新公司'), 'propose_update_company');
+  assert.equal(preferredAgentTool('统计各阶段岗位分布'), 'query_applications');
+  assert.equal(preferredAgentTool('查找投递日期没填的岗位'), 'query_applications');
+  assert.equal(preferredAgentTool('把未填投递日期的岗位改成已投递'), 'propose_update_job');
+  assert.equal(preferredAgentTool('删除没写投递日期的岗位'), 'propose_delete_job');
+  assert.equal(preferredAgentTool('查看墨尔本天气'), null);
+  assert.equal(preferredAgentTool('比较两款手机'), null);
+  assert.equal(preferredAgentTool('有没有下雨'), null);
+  assert.equal(preferredAgentTool('查看苹果公司股价'), null);
 });
 
 test('global emergency switch blocks upstream calls and creates no call record', async () => {
@@ -397,6 +456,54 @@ test('global emergency switch blocks upstream calls and creates no call record',
   assert.equal(database.calls.length, 0);
 });
 
+test('recent action outcome is account scoped across reopened sessions and bypasses model quota telemetry', async () => {
+  const database = new FakeAgentDatabase();
+  const ordinaryUser = { ...CHATGPT_USER, id: 'chatgpt-recent-action', subject: 'chatgpt-recent-action' };
+  database.defaultLimit = 0;
+  database.actionProposals.push(
+    {
+      accountKey: ordinaryUser.id,
+      sessionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      actionKind: 'add_job',
+      status: 'executed',
+      createdAtMs: NOW_MS - 120_000,
+    },
+    {
+      accountKey: 'chatgpt-other-account',
+      sessionId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      actionKind: 'delete_company',
+      status: 'cancelled',
+      createdAtMs: NOW_MS - 60_000,
+    },
+  );
+  let upstreamCalls = 0;
+  const result = await runAgentQuery({
+    database,
+    principal: ordinaryUser,
+    config: { ...CONFIG, apiKey: '', model: '' },
+    question: '刚才操作结果怎么样？',
+    idempotencyKey: 'recent-action-after-reopen',
+    sessionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+    now: () => NOW_MS,
+    fetcher: (async () => {
+      upstreamCalls += 1;
+      return arkSuccess();
+    }) as typeof fetch,
+  });
+
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.match(result.answer, /最近的新增岗位已经确认并保存/);
+    assert.doesNotMatch(result.answer, /删除公司/);
+    assert.deepEqual(result.usage, { inputTokens: 0, outputTokens: 0, totalTokens: 0 });
+    assert.equal(result.callId, '');
+    assert.equal(result.status.used, 0);
+    assert.equal(result.status.remaining, 0);
+  }
+  assert.equal(upstreamCalls, 0);
+  assert.equal(database.calls.length, 0);
+});
+
 test('technical upstream failure is audited but does not consume a successful-use quota', async () => {
   const database = new FakeAgentDatabase();
   database.globalEnabled = true;
@@ -411,11 +518,13 @@ test('technical upstream failure is audited but does not consume a successful-us
     fetcher: (async () => new Response('provider unavailable', { status: 503 })) as typeof fetch,
   });
 
-  assert.deepEqual(result, {
-    ok: false,
-    code: 'technical_failure',
-    message: AGENT_TECHNICAL_FAILURE_MESSAGE,
-  });
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.code, 'technical_failure');
+    assert.equal(result.message, AGENT_TECHNICAL_FAILURE_MESSAGE);
+    assert.equal(result.callId, database.calls[0].id);
+    assert.equal(await recordAgentFeedback(database, CHATGPT_USER, result.callId, 'unresolved', NOW_MS + 1), true);
+  }
   assert.equal(database.calls.length, 1);
   assert.equal(database.calls[0].status, 'technical_failure');
   assert.equal(database.calls[0].errorClass, 'ark_http_503');
@@ -480,6 +589,117 @@ test('successful response consumes one use and records model and tokens without 
   assert.equal('answer' in database.calls[0], false);
 });
 
+test('structured context preserves the exact legal UI stage values', async () => {
+  const database = new FakeAgentDatabase();
+  database.globalEnabled = true;
+  const ordinaryUser = { ...CHATGPT_USER, id: 'chatgpt-stage-fidelity', subject: 'chatgpt-stage-fidelity' };
+  database.applicationStates.set(ordinaryUser.id, JSON.stringify({
+    companies: [{
+      name: '阶段保真公司',
+      jobs: [
+        { title: '测评岗位', stage: '测评/笔试', process: [{ stage: '测评/笔试' }] },
+        { title: '后续面试岗位', stage: '后续面试', process: [{ stage: '后续面试' }] },
+      ],
+    }],
+  }));
+  let requestBody = '';
+  const result = await runAgentQuery({
+    database,
+    principal: ordinaryUser,
+    config: CONFIG,
+    question: '分析我的招聘进度节奏',
+    idempotencyKey: 'stage-fidelity-request',
+    sessionId: '77777777-7777-4777-8777-777777777777',
+    now: () => NOW_MS,
+    fetcher: (async (_input, init) => {
+      requestBody = String(init?.body ?? '');
+      return arkSuccess('阶段数据已读取。');
+    }) as typeof fetch,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(requestBody.includes('测评/笔试'), true);
+  assert.match(requestBody, /后续面试/);
+});
+
+test('a mismatched client state version stops before quota reservation and model access', async () => {
+  const database = new FakeAgentDatabase();
+  database.globalEnabled = true;
+  const ordinaryUser = { ...CHATGPT_USER, id: 'chatgpt-stale-state', subject: 'chatgpt-stale-state' };
+  database.applicationStateVersions.set(ordinaryUser.id, 'server-version');
+  let upstreamCalls = 0;
+  const result = await runAgentQuery({
+    database,
+    principal: ordinaryUser,
+    config: CONFIG,
+    question: '查看所有岗位',
+    idempotencyKey: 'stale-state-request',
+    sessionId: '88888888-8888-4888-8888-888888888888',
+    stateVersion: 'client-version',
+    now: () => NOW_MS,
+    fetcher: (async () => {
+      upstreamCalls += 1;
+      return arkSuccess();
+    }) as typeof fetch,
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.code, 'state_out_of_sync');
+  assert.equal(upstreamCalls, 0);
+  assert.equal(database.calls.length, 0);
+});
+
+test('out-of-scope questions send no unrelated application context', async () => {
+  const database = new FakeAgentDatabase();
+  database.globalEnabled = true;
+  const ordinaryUser = { ...CHATGPT_USER, id: 'chatgpt-weather', subject: 'chatgpt-weather' };
+  database.applicationStates.set(ordinaryUser.id, JSON.stringify({
+    companies: [{ name: '不应回显公司', jobs: [{ title: '不应回显岗位', stage: '已投递' }] }],
+  }));
+  let requestBody = '';
+  const result = await runAgentQuery({
+    database, principal: ordinaryUser, config: CONFIG,
+    question: '墨尔本今天天气怎么样？', idempotencyKey: 'weather-request',
+    sessionId: SESSION_ID, timeZone: 'Australia/Melbourne', now: () => NOW_MS,
+    fetcher: (async (_input, init) => {
+      requestBody = String(init?.body ?? '');
+      return arkSuccess('我只能协助求职管理与面试准备。');
+    }) as typeof fetch,
+  });
+  assert.equal(result.ok, true);
+  assert.doesNotMatch(requestBody, /不应回显公司|不应回显岗位/);
+  assert.match(requestBody, /本次问题不属于求职范围/);
+});
+
+test('planning and generic interview preparation use structured data without requiring optional fields', async () => {
+  const database = new FakeAgentDatabase();
+  database.globalEnabled = true;
+  const ordinaryUser = { ...CHATGPT_USER, id: 'chatgpt-preparation', subject: 'chatgpt-preparation' };
+  database.applicationStates.set(ordinaryUser.id, JSON.stringify({
+    companies: [{ name: '示例科技', jobs: [{ title: 'AI 产品经理', stage: '一面', priority: '高' }] }],
+  }));
+  const bodies: string[] = [];
+  for (const [index, question] of [
+    '基于现有数据给我前三个优先建议',
+    '帮我准备一次通用面试',
+  ].entries()) {
+    const result = await runAgentQuery({
+      database, principal: ordinaryUser, config: CONFIG, question,
+      idempotencyKey: `preparation-${index}`, sessionId: SESSION_ID,
+      timeZone: 'Asia/Shanghai', now: () => NOW_MS + index,
+      fetcher: (async (_input, init) => {
+        bodies.push(String(init?.body ?? ''));
+        return arkSuccess('先围绕目标岗位准备结构化案例。');
+      }) as typeof fetch,
+    });
+    assert.equal(result.ok, true);
+  }
+  assert.equal(bodies.length, 2);
+  for (const body of bodies) {
+    assert.match(body, /示例科技/);
+    assert.match(body, /AI 产品经理/);
+    assert.match(body, /不得因此完全拒绝回答/);
+  }
+});
+
 test('explicit CRUD sends one forced tool with a compact prompt instead of the full account context', async () => {
   const database = new FakeAgentDatabase();
   database.globalEnabled = true;
@@ -529,10 +749,30 @@ test('a relative date without a valid requester time zone stops before the model
   assert.equal(result.ok, false);
   if (!result.ok) {
     assert.equal(result.code, 'invalid_request');
-    assert.match(result.message, /没有调用模型或扣除次数/);
+    assert.match(result.message, /没有调用模型，也不会扣除次数/);
   }
   assert.equal(upstreamCalls, 0);
   assert.equal(database.calls.length, 0);
+});
+
+test('relative dates use the browser UTC offset when an IANA zone is unavailable', async () => {
+  const database = new FakeAgentDatabase();
+  database.globalEnabled = true;
+  let requestBody = '';
+  const ordinaryUser = { ...CHATGPT_USER, id: 'chatgpt-offset-date', subject: 'chatgpt-offset-date' };
+  const result = await runAgentQuery({
+    database, principal: ordinaryUser, config: CONFIG,
+    question: '加一个京东的产品经理岗位，投递日期写今天',
+    idempotencyKey: 'offset-time-zone', sessionId: SESSION_ID,
+    timeZone: 'CST', timeZoneOffsetMinutes: -480, now: () => Date.UTC(2026, 7, 31, 16, 30),
+    fetcher: (async (_input, init) => {
+      requestBody = String(init?.body ?? '');
+      return arkSuccess('模拟工具响应。');
+    }) as typeof fetch,
+  });
+  assert.equal(result.ok, true);
+  assert.match(requestBody, /UTC\+08:00/);
+  assert.match(requestBody, /2026-09-01/);
 });
 
 test('ordinary-user status and atomic reservation use the current default or per-user override', async () => {

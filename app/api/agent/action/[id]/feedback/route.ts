@@ -47,7 +47,7 @@ export async function POST(request: Request, context: RouteContext) {
     });
     return saved
       ? privateJson({ ok: true })
-      : privateJson({ error: 'feedback_not_saved', message: '这次评价没有保存，可能已评价过或操作尚未完成。' }, { status: 409 });
+      : privateJson({ error: 'feedback_not_saved', message: '这次评价没有保存，可能已评价过，或提案尚未取消或执行。' }, { status: 409 });
   } catch (error) {
     if (error instanceof AuthPrincipalConflictError) {
       return privateJson({ error: 'auth_identity_conflict' }, { status: 409 });

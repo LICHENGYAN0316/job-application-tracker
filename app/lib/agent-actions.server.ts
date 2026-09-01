@@ -77,8 +77,13 @@ export const AGENT_ACTION_TOOL_DEFINITIONS = [
         title: { type: 'string', maxLength: 160 },
         location: { type: 'string', maxLength: 120 },
         stage: { type: 'string', enum: ['', ...STAGES] },
+        appliedAt: {
+          type: 'string',
+          maxLength: 10,
+          description: '空字符串表示不限日期；“未填写”表示只查未填投递日期的岗位；其余使用 YYYY-MM-DD。',
+        },
       },
-      required: ['companyName', 'title', 'location', 'stage'],
+      required: ['companyName', 'title', 'location', 'stage', 'appliedAt'],
     },
   },
   {
@@ -472,16 +477,34 @@ function hasDateContext(question: string, context: string) {
   return new RegExp(context).test(question);
 }
 
-function explicitIsoDateNearContext(question: string, context: string) {
-  const match = new RegExp(
-    `(?:${context}).{0,12}(\\d{4}-\\d{2}-\\d{2})|(\\d{4}-\\d{2}-\\d{2}).{0,12}(?:${context})`,
+function normalizeExplicitDate(value: string, referenceDate = '') {
+  const normalized = value.replace(/\//g, '-').replace('年', '-').replace('月', '-').replace('日', '');
+  const parts = normalized.split('-');
+  if (parts.length === 2 && /^\d{4}-\d{2}-\d{2}$/.test(referenceDate)) {
+    parts.unshift(referenceDate.slice(0, 4));
+  }
+  if (parts.length !== 3) return '';
+  const [year, month, day] = parts.map(Number);
+  const result = `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  return validDate(result) ? result : '';
+}
+
+function explicitIsoDateNearContext(question: string, context: string, referenceDate = '') {
+  const datePattern = '(\\d{4}(?:-|/|年)\\d{1,2}(?:-|/|月)\\d{1,2}日?|\\d{1,2}月\\d{1,2}日)';
+  const followingContext = new RegExp(
+    `(?:${context})[^,，。；;!！?？]{0,20}?${datePattern}`,
   ).exec(question);
-  return match?.[1] ?? match?.[2] ?? '';
+  const followingDate = normalizeExplicitDate(followingContext?.[1] ?? '', referenceDate);
+  if (followingDate) return followingDate;
+  const precedingContext = new RegExp(
+    `${datePattern}[^,，。；;!！?？]{0,12}?(?:${context})`,
+  ).exec(question);
+  return normalizeExplicitDate(precedingContext?.[1] ?? '', referenceDate);
 }
 
 function requestsEmptyDate(question: string, context: string) {
   return new RegExp(
-    `(?:${context}).{0,12}(?:未填(?:写)?|不填|留空|空着|没有|无)|(?:未填(?:写)?|不填|留空|空着|没有|无).{0,12}(?:${context})`,
+    `(?:${context}).{0,12}(?:未填(?:写)?|未写|没填|没写|不填|留空|空着|没有|无)|(?:未填(?:写)?|未写|没填|没写|不填|留空|空着|没有|无).{0,12}(?:${context})`,
   ).test(question);
 }
 
@@ -527,7 +550,7 @@ function normalizeRelativeToolDates(options: {
     if (appliedAt.matched) {
       argumentsRecord.appliedAt = appliedAt.value;
     } else {
-      const explicitDate = explicitIsoDateNearContext(question, APPLICATION_DATE_CONTEXT);
+      const explicitDate = explicitIsoDateNearContext(question, APPLICATION_DATE_CONTEXT, referenceDate);
       if (explicitDate) {
         argumentsRecord.appliedAt = explicitDate;
       } else if (!hasDateContext(question, APPLICATION_DATE_CONTEXT)) {
@@ -547,7 +570,13 @@ function normalizeRelativeToolDates(options: {
       if (nextDate.matched) {
         argumentsRecord.nextDate = nextDate.value;
       } else {
-        const explicitDate = explicitIsoDateNearContext(question, NEXT_DATE_CONTEXT);
+        const explicitDate = explicitIsoDateNearContext(question, NEXT_DATE_CONTEXT, referenceDate)
+          || (
+            /(?:下一步|待办)/.test(question)
+            && !hasDateContext(question, APPLICATION_DATE_CONTEXT)
+              ? explicitIsoDateNearContext(question, '(?:日期|时间)', referenceDate)
+              : ''
+          );
         if (explicitDate) {
           argumentsRecord.nextDate = explicitDate;
         } else if (!hasDateContext(question, NEXT_DATE_CONTEXT)) {
@@ -558,6 +587,118 @@ function normalizeRelativeToolDates(options: {
   }
 
   return { ok: true as const, argumentsRecord };
+}
+
+const UPDATE_JOB_ARGUMENT_KEYS = [
+  'companyName', 'title', 'location', 'newTitle', 'newLocation',
+  'portalUrl', 'appliedAt', 'stage', 'priority', 'nextAction', 'nextDate',
+] as const;
+
+function cleanCapturedValue(value: string, maximumLength: number) {
+  return boundedString(value, maximumLength)
+    .replace(/^[“”"'「」『』]+|[“”"'「」『』]+$/g, '')
+    .trim();
+}
+
+function renamedValueFromQuestion(question: string, target: 'company' | 'job') {
+  const normalized = boundedString(question, 800);
+  const specific = target === 'company'
+    ? /(?:公司名|公司名称).{0,8}(?:改成|改为|设为|重命名为)\s*([^,，。；;!！?？]+)/
+    : /(?:岗位名|岗位名称|职位名|职位名称).{0,8}(?:改成|改为|设为|重命名为)\s*([^,，。；;!！?？]+)/;
+  const generic = /(?:改名为|重命名为)\s*([^,，。；;!！?？]+)/;
+  const match = specific.exec(normalized) ?? generic.exec(normalized);
+  return cleanCapturedValue(match?.[1] ?? '', target === 'company' ? 120 : 160);
+}
+
+function priorityFromQuestion(question: string) {
+  const match = /(?:优先级).{0,10}(?:改成|改为|设成|设为|设置成|设置为|调整为|是)?\s*(高|中|低)(?:优先级)?/.exec(question);
+  return match?.[1] ?? '';
+}
+
+function nextActionFromQuestion(question: string) {
+  const match = /(?:下一步(?!\s*日期)(?:行动)?|待办)\s*(?:改成|改为|设成|设为|设置成|设置为|填写为|填写|改)?\s*[:：]?\s*([^,，。；;!！?？]+?)(?=\s*(?:[,，]\s*(?:日期|时间|下一步日期|提醒日期)|[。；;!！?？]|$))/.exec(question);
+  return cleanCapturedValue(match?.[1] ?? '', 500);
+}
+
+function portalUrlFromQuestion(question: string) {
+  if (!/(?:岗位链接|职位链接|申请链接|投递链接|链接|网址)/.test(question)) return null;
+  if (/(?:岗位链接|职位链接|申请链接|投递链接|链接|网址).{0,8}(?:清空|删除|留空|未填|不填)/.test(question)) return '';
+  const match = /https?:\/\/[^\s,，。；;!！?？]+/i.exec(question);
+  return match?.[0] ?? null;
+}
+
+function normalizedStageValue(value: string) {
+  const normalized = value.replace(/[\s“”"'「」『』]/g, '').replace(/(?:阶段|状态)$/, '');
+  if (VALID_STAGES.has(normalized)) return normalized;
+  if (/^(?:投递|已投|已投递)$/.test(normalized)) return '已投递';
+  if (/^(?:测评|笔试|测评\/笔试)$/.test(normalized)) return '测评/笔试';
+  if (/^(?:初面|一面)$/.test(normalized)) return '一面';
+  if (/^(?:二面|三面|四面|复试|终面|后续面试)$/.test(normalized)) return '后续面试';
+  if (/^(?:offer|录用|收到offer)$/i.test(normalized)) return 'Offer';
+  if (/^(?:人才库|进入人才库)$/.test(normalized)) return '进入人才库';
+  if (/^(?:被拒|拒绝|挂了|淘汰)$/.test(normalized)) return '被拒';
+  if (/^(?:结束|已结束)$/.test(normalized)) return '已结束';
+  if (/^(?:意向|意向岗位)$/.test(normalized)) return '意向岗位';
+  return '';
+}
+
+function requestedStageFromQuestion(question: string) {
+  const explicit = /(?:阶段|状态|招聘流程).{0,8}(?:改成|改为|设成|设为|设置成|设置为|更新为|调整为|推进到)\s*([^,，。；;!！?？]+)/.exec(question)
+    ?? /(?:推进到)\s*([^,，。；;!！?？]+)/.exec(question);
+  if (explicit) return { explicit: true as const, raw: cleanCapturedValue(explicit[1] ?? '', 40) };
+  const generic = /(?:改成|改为|设成|设为|调整为)\s*([^,，。；;!！?？]+)$/.exec(question);
+  const raw = cleanCapturedValue(generic?.[1] ?? '', 40);
+  return { explicit: false as const, raw: normalizedStageValue(raw) ? raw : '' };
+}
+
+function normalizeUpdateArguments(
+  toolName: string,
+  argumentsRecord: Record<string, unknown>,
+  questionValue: unknown,
+) {
+  const question = boundedString(questionValue, 800);
+  if (toolName === 'propose_update_company') {
+    const normalized: Record<string, unknown> = {
+      companyName: '', newName: null, website: null, ...argumentsRecord,
+    };
+    const renamed = renamedValueFromQuestion(question, 'company');
+    if (renamed) normalized.newName = renamed;
+    return { ok: true as const, argumentsRecord: normalized };
+  }
+  if (toolName !== 'propose_update_job') {
+    return { ok: true as const, argumentsRecord };
+  }
+  const normalized: Record<string, unknown> = Object.fromEntries(
+    UPDATE_JOB_ARGUMENT_KEYS.map((key) => [key, ['companyName', 'title', 'location'].includes(key) ? '' : null]),
+  );
+  Object.assign(normalized, argumentsRecord);
+  const renamed = renamedValueFromQuestion(question, 'job');
+  const priority = priorityFromQuestion(question);
+  const nextAction = nextActionFromQuestion(question);
+  const portalUrl = portalUrlFromQuestion(question);
+  if (renamed) normalized.newTitle = renamed;
+  if (priority) normalized.priority = priority;
+  if (nextAction) normalized.nextAction = nextAction;
+  if (portalUrl !== null) normalized.portalUrl = portalUrl;
+
+  const requestedStage = requestedStageFromQuestion(question);
+  if (requestedStage.raw) {
+    const stage = normalizedStageValue(requestedStage.raw);
+    if (stage) {
+      normalized.stage = stage;
+    } else if (requestedStage.explicit) {
+      return {
+        ok: false as const,
+        message: `“${requestedStage.raw}”不是可用的招聘流程。请选择：${[...VALID_STAGES].join('、')}。本次没有修改数据。`,
+      };
+    }
+  } else if (requestedStage.explicit) {
+    return {
+      ok: false as const,
+      message: `“${requestedStage.raw || '该状态'}”不是可用的招聘流程。请选择：${[...VALID_STAGES].join('、')}。本次没有修改数据。`,
+    };
+  }
+  return { ok: true as const, argumentsRecord: normalized };
 }
 
 export function parseAgentActionToolCall(value: unknown): ParsedActionResult {
@@ -706,6 +847,48 @@ export async function expireAgentActionProposals(
   return result.meta?.changes ?? 0;
 }
 
+export function agentQuestionAsksRecentActionOutcome(value: unknown) {
+  const question = boundedString(value, 800).replace(/\s+/g, '');
+  return /(?:刚才|刚刚|上次|之前).*(?:操作|创建|新增|添加|修改|删除).*(?:成功|完成|执行|取消|了吗|了没有|了么)/.test(question);
+}
+
+export async function readLatestAgentActionOutcome(
+  database: AgentActionDatabase,
+  accountKey: string,
+  sessionId: string,
+) {
+  if (!VALID_UUID.test(sessionId)) return '';
+  try {
+    const row = await database.prepare(`
+      SELECT action_kind, status
+      FROM agent_action_proposals
+      WHERE account_key = ? AND session_id = ?
+      ORDER BY created_at_ms DESC
+      LIMIT 1
+    `).bind(accountKey, sessionId).first<{ action_kind: AgentActionKind; status: AgentActionStatus }>();
+    if (!row) return '';
+    const labels: Record<AgentActionKind, string> = {
+      add_company: '新增公司',
+      add_job: '新增岗位',
+      add_company_job: '创建公司和岗位',
+      update_company: '修改公司',
+      update_job: '修改岗位',
+      delete_company: '删除公司',
+      delete_job: '删除岗位',
+    };
+    const label = labels[row.action_kind] ?? '操作';
+    if (row.status === 'executed') return `刚才的${label}已经确认并保存。`;
+    if (row.status === 'cancelled') return `刚才的${label}已取消，没有修改任何求职数据。`;
+    if (row.status === 'awaiting_confirmation') return `刚才的${label}仍在等待你确认，尚未修改数据。`;
+    if (row.status === 'executing') return `刚才的${label}正在安全保存，请稍后刷新核对。`;
+    if (row.status === 'expired') return `刚才的${label}提案已过期，没有修改数据。`;
+    if (row.status === 'conflict') return `刚才的${label}因数据版本冲突未执行，没有重复写入。`;
+    return `刚才的${label}未完成，没有修改数据。`;
+  } catch {
+    return '';
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
@@ -792,6 +975,100 @@ function matchingJobs(company: CompanyRecord, title: string, location: string) {
   ));
 }
 
+function questionIdentity(value: string) {
+  return normalizeIdentityPart(value).replace(/\s+/g, '');
+}
+
+function questionContainsIdentity(question: string, value: string) {
+  const identity = questionIdentity(value);
+  return Boolean(identity) && questionIdentity(question).includes(identity);
+}
+
+function mostSpecificMentionedJobs<T extends { job: JobRecord }>(matches: T[]) {
+  return matches.filter(({ job }, index) => {
+    const title = questionIdentity(job.title);
+    return !matches.some(({ job: otherJob }, otherIndex) => {
+      if (index === otherIndex) return false;
+      const otherTitle = questionIdentity(otherJob.title);
+      return otherTitle.length > title.length && otherTitle.includes(title);
+    });
+  });
+}
+
+async function resolveKnownToolTargets(options: {
+  database: AgentActionDatabase;
+  accountKey: string;
+  toolName: string;
+  argumentsRecord: Record<string, unknown>;
+  question: unknown;
+}): Promise<{
+  argumentsRecord: Record<string, unknown>;
+  ambiguousCandidates?: AgentActionCandidate[];
+}> {
+  const question = boundedString(options.question, 800);
+  if (!question) return { argumentsRecord: options.argumentsRecord };
+  const loaded = await loadState(options.database, options.accountKey);
+  if (!loaded) return { argumentsRecord: options.argumentsRecord };
+  const argumentsRecord = { ...options.argumentsRecord };
+  const companyMatches = loaded.state.companies
+    .filter((company) => questionContainsIdentity(question, company.name))
+    .sort((left, right) => questionIdentity(right.name).length - questionIdentity(left.name).length);
+  const longestCompany = companyMatches[0];
+  const sameLengthCompany = longestCompany
+    ? companyMatches.filter((company) => questionIdentity(company.name).length === questionIdentity(longestCompany.name).length)
+    : [];
+  const company = sameLengthCompany.length === 1 ? longestCompany : null;
+
+  const mentionedJobs = mostSpecificMentionedJobs(
+    loaded.state.companies.flatMap((candidateCompany) => candidateCompany.jobs.flatMap((job) => (
+      questionContainsIdentity(question, job.title)
+        ? [{ company: candidateCompany, job }]
+        : []
+    ))),
+  );
+  const jobMatches = company
+    ? mentionedJobs.filter(({ company: candidateCompany }) => candidateCompany.id === company.id)
+    : mentionedJobs;
+  const locationMatches = jobMatches.filter(({ job }) => (
+    typeof job.location === 'string'
+    && Boolean(job.location)
+    && questionContainsIdentity(question, job.location)
+  ));
+  const uniqueJob = locationMatches.length === 1
+    ? locationMatches[0]
+    : jobMatches.length === 1
+      ? jobMatches[0]
+      : null;
+
+  if (['propose_update_job', 'propose_delete_job', 'query_applications'].includes(options.toolName) && uniqueJob) {
+    argumentsRecord.companyName = uniqueJob.company.name;
+    argumentsRecord.title = uniqueJob.job.title;
+    argumentsRecord.location = typeof uniqueJob.job.location === 'string' ? uniqueJob.job.location : '';
+    return { argumentsRecord };
+  }
+  if (
+    ['propose_update_job', 'propose_delete_job'].includes(options.toolName)
+    && jobMatches.length > 1
+  ) {
+    return {
+      argumentsRecord,
+      ambiguousCandidates: jobMatches.slice(0, 10).map(({ company: candidateCompany, job }) => ({
+        id: job.id,
+        label: `${candidateCompany.name} · ${job.title}`,
+        detail: typeof job.location === 'string' && job.location ? job.location : '地点未填写',
+      })),
+    };
+  }
+  if (['propose_update_company', 'propose_delete_company', 'query_applications'].includes(options.toolName) && company) {
+    argumentsRecord.companyName = company.name;
+    if (options.toolName === 'query_applications') {
+      argumentsRecord.title = '';
+      argumentsRecord.location = '';
+    }
+  }
+  return { argumentsRecord };
+}
+
 function jobCandidates(company: CompanyRecord, jobs: JobRecord[]): AgentActionCandidate[] {
   return jobs.slice(0, 10).map((job) => ({
     id: job.id,
@@ -805,60 +1082,154 @@ type AgentReadQuery = {
   title: string;
   location: string;
   stage: string;
+  appliedAt: string;
 };
 
 function parseAgentReadQuery(value: unknown): AgentReadQuery | null {
-  if (!isRecord(value) || !exactKeys(value, ['companyName', 'title', 'location', 'stage'])) return null;
+  if (!isRecord(value)) return null;
+  const currentKeys = ['companyName', 'title', 'location', 'stage', 'appliedAt'] as const;
+  const legacyKeys = ['companyName', 'title', 'location', 'stage'] as const;
+  if (!exactKeys(value, currentKeys) && !exactKeys(value, legacyKeys)) return null;
   const companyName = boundedString(value.companyName, 120);
   const title = boundedString(value.title, 160);
   const location = boundedString(value.location, 120);
   const stage = boundedString(value.stage, 30);
+  const appliedAt = 'appliedAt' in value ? boundedString(value.appliedAt, 10) : '';
   if (
     typeof value.companyName !== 'string'
     || typeof value.title !== 'string'
     || typeof value.location !== 'string'
     || typeof value.stage !== 'string'
+    || ('appliedAt' in value && typeof value.appliedAt !== 'string')
     || (stage && !VALID_STAGES.has(stage))
+    || (appliedAt && appliedAt !== '未填写' && !validDate(appliedAt))
   ) return null;
-  return { companyName, title, location, stage };
+  return { companyName, title, location, stage, appliedAt };
+}
+
+function normalizeMention(value: string) {
+  return normalizeIdentityPart(value).replace(/\s+/g, '');
+}
+
+function exactIdentity(value: string, search: string) {
+  return normalizeIdentityPart(value) === normalizeIdentityPart(search);
 }
 
 function containsIdentity(value: string, search: string) {
-  return !search || normalizeIdentityPart(value).includes(normalizeIdentityPart(search));
+  return normalizeIdentityPart(value).includes(normalizeIdentityPart(search));
+}
+
+function stagesMentionedInQuestion(question: string) {
+  const normalized = normalizeMention(question);
+  const stages = new Set<string>();
+  for (const stage of STAGES) {
+    if (normalized.includes(normalizeMention(stage))) stages.add(stage);
+  }
+  if (/(?:二面|三面|终面|后续轮次|复试)/.test(normalized)) stages.add('后续面试');
+  if (normalized.includes('笔试')) stages.add('测评/笔试');
+  return stages;
+}
+
+function normalizeAgentReadQueryDates(
+  value: Record<string, unknown> | null,
+  questionValue: unknown,
+  referenceDateValue: unknown,
+) {
+  if (!value) return { ok: true as const, value };
+  const question = compactQuestion(questionValue);
+  const referenceDate = boundedString(referenceDateValue, 10);
+  const normalized = { ...value, appliedAt: typeof value.appliedAt === 'string' ? value.appliedAt : '' };
+  if (requestsEmptyDate(question, APPLICATION_DATE_CONTEXT)) {
+    normalized.appliedAt = '未填写';
+    return { ok: true as const, value: normalized };
+  }
+  const relativeDate = relativeDateFromQuestion(question, APPLICATION_DATE_CONTEXT, referenceDate);
+  if (relativeDate.matched && 'invalidReferenceDate' in relativeDate) return { ok: false as const, value: normalized };
+  if (relativeDate.matched) {
+    normalized.appliedAt = relativeDate.value;
+  } else {
+    const explicitDate = explicitIsoDateNearContext(question, APPLICATION_DATE_CONTEXT, referenceDate);
+    const modelDate = typeof value.appliedAt === 'string'
+      && validDate(value.appliedAt)
+      && value.appliedAt
+      ? value.appliedAt
+      : '';
+    const questionContainsExplicitDate = /(?:\d{4}(?:-|\/|年)\d{1,2}(?:-|\/|月)\d{1,2}日?|\d{1,2}月\d{1,2}日)/.test(question);
+    normalized.appliedAt = explicitDate
+      || (questionContainsExplicitDate && hasDateContext(question, APPLICATION_DATE_CONTEXT) ? modelDate : '')
+      || '';
+  }
+  return { ok: true as const, value: normalized };
 }
 
 async function executeAgentReadQuery(
   database: AgentActionDatabase,
   accountKey: string,
   query: AgentReadQuery,
+  question: string,
 ) {
   const loaded = await loadState(database, accountKey);
   if (!loaded) return '当前求职数据暂时无法安全读取，本次没有修改任何数据。';
-  const companies = loaded.state.companies.filter((company) => containsIdentity(company.name, query.companyName));
+  const normalizedQuestion = normalizeMention(question);
+  const explicitlyMentionedCompanies = loaded.state.companies.filter((company) => (
+    normalizedQuestion.includes(normalizeMention(company.name))
+  ));
+  const companies = explicitlyMentionedCompanies.length > 0
+    ? explicitlyMentionedCompanies
+    : query.companyName
+      ? loaded.state.companies.filter((company) => exactIdentity(company.name, query.companyName))
+      : loaded.state.companies;
+  const explicitlyMentionedJobIds = new Set(mostSpecificMentionedJobs(
+    companies.flatMap((company) => company.jobs.flatMap((job) => (
+      normalizedQuestion.includes(normalizeMention(job.title)) ? [{ company, job }] : []
+    ))),
+  ).map(({ job }) => job.id));
+  const exactTitleExists = Boolean(query.title) && companies.some((company) => (
+    company.jobs.some((job) => exactIdentity(job.title, query.title))
+  ));
+  const requestedStages = stagesMentionedInQuestion(question);
+  if (requestedStages.size === 0 && query.stage) requestedStages.add(query.stage);
   const matches = companies.flatMap((company) => company.jobs.flatMap((job) => {
     const jobLocation = typeof job.location === 'string' ? job.location : '';
     const jobStage = typeof job.stage === 'string' ? job.stage : '';
+    const jobAppliedAt = typeof job.appliedAt === 'string' ? job.appliedAt : '';
+    const titleMatches = explicitlyMentionedJobIds.size > 0
+      ? explicitlyMentionedJobIds.has(job.id)
+      : !query.title
+        || (exactTitleExists ? exactIdentity(job.title, query.title) : containsIdentity(job.title, query.title));
     if (
-      !containsIdentity(job.title, query.title)
-      || !containsIdentity(jobLocation, query.location)
-      || (query.stage && jobStage !== query.stage)
+      !titleMatches
+      || (query.location && !exactIdentity(jobLocation, query.location))
+      || (requestedStages.size > 0 && !requestedStages.has(jobStage))
+      || (query.appliedAt === '未填写' && Boolean(jobAppliedAt))
+      || (query.appliedAt && query.appliedAt !== '未填写' && jobAppliedAt !== query.appliedAt)
     ) return [];
-    return [{ company, job, jobLocation, jobStage }];
+    return [{ company, job, jobLocation, jobStage, jobAppliedAt }];
   }));
   if (matches.length === 0) {
-    if (companies.length === 1 && !query.title && !query.location && !query.stage) {
+    if (companies.length === 1 && !query.title && !query.location && !query.stage && !query.appliedAt) {
       return `已找到“${companies[0].name}”，当前还没有岗位记录。`;
     }
     return '没有找到符合条件的岗位，本次查询不会修改数据。';
   }
-  const lines = matches.slice(0, 20).map(({ company, job, jobLocation, jobStage }) => {
-    const appliedAt = typeof job.appliedAt === 'string' && job.appliedAt ? job.appliedAt : '未填写投递日期';
+  const stageCounts = new Map<string, number>();
+  for (const { jobStage } of matches) stageCounts.set(jobStage, (stageCounts.get(jobStage) ?? 0) + 1);
+  const stageSummary = STAGES.flatMap((stage) => {
+    const count = stageCounts.get(stage) ?? 0;
+    return count > 0 ? [`${stage} ${count}`] : [];
+  }).join('、');
+  const visibleMatches = matches.slice(0, 100);
+  const lines = visibleMatches.map(({ company, job, jobLocation, jobStage, jobAppliedAt }) => {
+    const appliedAt = jobAppliedAt || '未填写投递日期';
     return `· ${company.name} · ${job.title} · ${jobLocation || '地点未填写'} · ${jobStage || '流程未填写'} · ${appliedAt}`;
   });
   return [
-    `找到 ${matches.length} 个符合条件的岗位：`,
+    `${/(比较|对比)/.test(question) ? '对比找到' : '找到'} ${matches.length} 个符合条件的岗位：`,
+    `阶段分布：${stageSummary || '暂无可统计阶段'}。`,
     ...lines,
-    ...(matches.length > lines.length ? [`其余 ${matches.length - lines.length} 个岗位未展开，请继续缩小查询范围。`] : []),
+    ...(matches.length > visibleMatches.length
+      ? [`当前展示第 1–${visibleMatches.length} 个，共 ${matches.length} 个；请指定公司、阶段或日期继续查询。`]
+      : []),
   ].join('\n');
 }
 
@@ -1349,6 +1720,7 @@ export async function prepareAgentActionFromToolCall(options: {
   await expireAgentActionProposals(options.database, options.principal.id, nowMs);
   const toolName = boundedString(options.toolName, 80);
   let argumentsRecord: Record<string, unknown> | null = null;
+  let targetAmbiguity: AgentActionCandidate[] = [];
   try {
     const parsed = typeof options.argumentsJson === 'string'
       ? JSON.parse(options.argumentsJson) as unknown
@@ -1358,8 +1730,25 @@ export async function prepareAgentActionFromToolCall(options: {
     argumentsRecord = null;
   }
 
+  if (argumentsRecord) {
+    const resolvedTargets = await resolveKnownToolTargets({
+      database: options.database,
+      accountKey: options.principal.id,
+      toolName,
+      argumentsRecord,
+      question: options.question,
+    });
+    argumentsRecord = resolvedTargets.argumentsRecord;
+    targetAmbiguity = resolvedTargets.ambiguousCandidates ?? [];
+  }
+
   if (toolName === 'query_applications') {
-    const query = parseAgentReadQuery(argumentsRecord);
+    const normalizedReadQuery = normalizeAgentReadQueryDates(
+      argumentsRecord,
+      options.question,
+      options.referenceDate,
+    );
+    const query = normalizedReadQuery.ok ? parseAgentReadQuery(normalizedReadQuery.value) : null;
     if (!query) {
       await recordEvent(options.database, {
         id: crypto.randomUUID(), accountKey: options.principal.id,
@@ -1368,7 +1757,12 @@ export async function prepareAgentActionFromToolCall(options: {
       });
       return { kind: 'clarification', message: '查询条件不完整，请换一种说法后再试；本次没有修改数据。' };
     }
-    const message = await executeAgentReadQuery(options.database, options.principal.id, query);
+    const message = await executeAgentReadQuery(
+      options.database,
+      options.principal.id,
+      query,
+      boundedString(options.question, 800),
+    );
     await recordEvent(options.database, {
       id: crypto.randomUUID(), accountKey: options.principal.id,
       sessionId: boundedString(options.sessionId, 100), eventType: 'read_executed',
@@ -1397,6 +1791,25 @@ export async function prepareAgentActionFromToolCall(options: {
       nowMs,
     });
     return { kind: 'clarification', message: '这类操作尚未开放，本次没有修改数据。' };
+  }
+  if (targetAmbiguity.length > 0) {
+    await recordEvent(options.database, {
+      id: crypto.randomUUID(),
+      accountKey: options.principal.id,
+      sessionId: boundedString(options.sessionId, 100),
+      actionKind,
+      eventType: 'clarification_required',
+      reasonCode: 'ambiguous_target',
+      schemaValid: true,
+      ambiguityDetected: true,
+      ambiguityHandled: true,
+      nowMs,
+    });
+    return {
+      kind: 'clarification',
+      message: '找到多个同名岗位，请补充公司或地点后再试；本次没有修改数据。',
+      candidates: targetAmbiguity,
+    };
   }
   if (!argumentsRecord) {
     await recordEvent(options.database, {
@@ -1436,6 +1849,23 @@ export async function prepareAgentActionFromToolCall(options: {
     };
   }
   argumentsRecord = normalizedDates.argumentsRecord;
+  const normalizedUpdate = normalizeUpdateArguments(toolName, argumentsRecord, options.question);
+  if (!normalizedUpdate.ok) {
+    await recordEvent(options.database, {
+      id: crypto.randomUUID(),
+      accountKey: options.principal.id,
+      sessionId: boundedString(options.sessionId, 100),
+      actionKind,
+      eventType: 'clarification_required',
+      reasonCode: 'invalid_stage',
+      schemaValid: true,
+      ambiguityDetected: true,
+      ambiguityHandled: true,
+      nowMs,
+    });
+    return { kind: 'clarification', message: normalizedUpdate.message };
+  }
+  argumentsRecord = normalizedUpdate.argumentsRecord;
   if (actionKind === 'add_job') {
     argumentsRecord = {
       ...argumentsRecord,
@@ -1968,7 +2398,8 @@ export async function recordAgentActionFeedback(options: {
   const result = await options.database.prepare(`
     UPDATE agent_action_proposals
     SET feedback = ?, feedback_at_ms = ?
-    WHERE id = ? AND account_key = ? AND status = 'executed' AND feedback IS NULL
+    WHERE id = ? AND account_key = ?
+      AND status IN ('executed', 'cancelled') AND feedback IS NULL
   `).bind(outcome, nowMs, actionId, options.principal.id).run();
   if (!changed(result)) return false;
   const row = await proposalRow(options.database, actionId, options.principal.id);

@@ -88,7 +88,7 @@ test('real SQLite query merges action feedback and excludes legacy zero-latency 
         ('call-analysis', 'user-a', 'chatgpt', 0, 'idem-b', 'session-analysis', 'success',
          11, 21, 31, 'model', 30, 200, 0, 'resolved', 32),
         ('call-failed', 'user-a', 'chatgpt', 0, 'idem-c', 'session-failed', 'technical_failure',
-         12, 22, 32, 'model', 0, 0, 0, NULL, NULL);
+         12, 22, 32, 'model', 0, 0, 0, 'unresolved', 33);
       INSERT INTO agent_action_proposals
         (id, account_key, session_id, source_call_id, idempotency_key, action_kind,
          base_state_version, confirmation_nonce_hash, status, created_at_ms, expires_at_ms,
@@ -103,7 +103,8 @@ test('real SQLite query merges action feedback and excludes legacy zero-latency 
         ('event-confirm', 'proposal-a', 'user-a', 'session-action', 'add_company', 'confirmation_attempted', NULL, 20),
         ('event-confirm-replay', 'proposal-a', 'user-a', 'session-action', 'add_company', 'confirmation_attempted', NULL, 21),
         ('event-started', 'proposal-a', 'user-a', 'session-action', 'add_company', 'execution_started', NULL, 22),
-        ('event-executed', 'proposal-a', 'user-a', 'session-action', 'add_company', 'executed', NULL, 30);
+        ('event-executed', 'proposal-a', 'user-a', 'session-action', 'add_company', 'executed', NULL, 30),
+        ('event-prestart-conflict', 'proposal-conflict', 'user-a', 'session-conflict', 'update_job', 'execution_conflict', NULL, 31);
     `);
 
     const dashboard = await readAgentAdminDashboard(
@@ -114,9 +115,9 @@ test('real SQLite query merges action feedback and excludes legacy zero-latency 
     );
 
     assert.equal(dashboard.quality.technicalSuccessRate, 2 / 3);
-    assert.equal(dashboard.quality.taskSuccessRate, 1);
-    assert.equal(dashboard.quality.ratedTasks, 2);
-    assert.equal(dashboard.quality.oneRoundResolutionRate, 1);
+    assert.equal(dashboard.quality.taskSuccessRate, 2 / 3);
+    assert.equal(dashboard.quality.ratedTasks, 3);
+    assert.equal(dashboard.quality.oneRoundResolutionRate, 2 / 3);
     assert.equal(dashboard.quality.feedbackCoverageRate, 1);
     assert.equal(dashboard.quality.averageCompletedRounds, 1);
     assert.equal(dashboard.quality.latencySamples, 1);
@@ -125,6 +126,8 @@ test('real SQLite query merges action feedback and excludes legacy zero-latency 
     assert.equal(dashboard.quality.toolParameterSamples, 1);
     assert.equal(dashboard.quality.actionExecutionSamples, 1, 'a replayed confirmation counts once');
     assert.equal(dashboard.quality.actionExecutionSuccessRate, 1);
+    assert.equal(dashboard.quality.versionConflictSamples, 2);
+    assert.equal(dashboard.quality.versionConflictRate, 0.5);
   } finally {
     database.raw.close();
   }

@@ -149,7 +149,7 @@ export async function readAgentAdminDashboard(
         SELECT COUNT(*) FROM (
           SELECT account_key, session_id
           FROM agent_calls
-          WHERE status = 'success' AND session_id <> ''
+          WHERE status IN ('success', 'technical_failure') AND session_id <> ''
           GROUP BY account_key, session_id
         )
       ) AS successful_sessions,
@@ -157,7 +157,8 @@ export async function readAgentAdminDashboard(
         SELECT COUNT(*) FROM (
           SELECT account_key, session_id
           FROM agent_calls
-          WHERE session_id <> '' AND feedback IS NOT NULL
+          WHERE status IN ('success', 'technical_failure')
+            AND session_id <> '' AND feedback IS NOT NULL
           GROUP BY account_key, session_id
           UNION
           SELECT account_key, session_id
@@ -170,7 +171,20 @@ export async function readAgentAdminDashboard(
         SELECT COUNT(*) FROM (
           SELECT account_key, session_id
           FROM agent_calls
-          WHERE session_id <> '' AND feedback = 'resolved'
+          WHERE session_id <> '' AND feedback IS NOT NULL
+          GROUP BY account_key, session_id
+          UNION
+          SELECT account_key, session_id
+          FROM agent_action_proposals
+          WHERE session_id <> '' AND feedback IS NOT NULL
+          GROUP BY account_key, session_id
+        )
+      ) AS feedback_tasks,
+      (
+        SELECT COUNT(*) FROM (
+          SELECT account_key, session_id
+          FROM agent_calls
+          WHERE status = 'success' AND session_id <> '' AND feedback = 'resolved'
           GROUP BY account_key, session_id
           UNION
           SELECT account_key, session_id
@@ -273,7 +287,12 @@ export async function readAgentAdminDashboard(
       (
         SELECT COUNT(DISTINCT proposal_id) FROM agent_action_events
         WHERE event_type = 'execution_conflict'
-      ) AS version_conflicts
+      ) AS version_conflicts,
+      (
+        SELECT COUNT(DISTINCT proposal_id) FROM agent_action_events
+        WHERE event_type IN ('execution_started', 'execution_conflict')
+          AND proposal_id <> ''
+      ) AS version_conflict_samples
     FROM agent_calls
   `).first<Record<string, unknown>>();
 
@@ -289,6 +308,7 @@ export async function readAgentAdminDashboard(
   const technicalFailures = integer(quality?.technical_failures);
   const latencySamples = integer(quality?.latency_samples);
   const ratedTasks = integer(quality?.rated_tasks);
+  const feedbackTasks = integer(quality?.feedback_tasks);
   const completedTasks = integer(quality?.completed_tasks);
   const successfulSessions = integer(quality?.successful_sessions);
   const oneRoundResolvedTasks = integer(quality?.one_round_resolved_tasks);
@@ -301,6 +321,7 @@ export async function readAgentAdminDashboard(
   const actionFeedbackSamples = integer(quality?.action_feedback_samples);
   const incorrectActions = integer(quality?.incorrect_actions);
   const versionConflicts = integer(quality?.version_conflicts);
+  const versionConflictSamples = integer(quality?.version_conflict_samples);
 
   return {
     globalEnabled: integer(setting?.global_enabled) === 1,
@@ -330,7 +351,7 @@ export async function readAgentAdminDashboard(
       ratedTasks,
       oneRoundResolutionRate: ratio(oneRoundResolvedTasks, ratedTasks),
       oneRoundResolvedTasks,
-      feedbackCoverageRate: ratio(ratedTasks, successfulSessions),
+      feedbackCoverageRate: ratio(feedbackTasks, successfulSessions),
       feedbackEligibleTasks: successfulSessions,
       toolParameterSchemaPassRate: ratio(validToolParameters, toolParameterSamples),
       toolParameterSamples,
@@ -342,8 +363,8 @@ export async function readAgentAdminDashboard(
       actionFeedbackSamples,
       unauthorizedExecutionCount: integer(quality?.unauthorized_executions),
       duplicateBlockedCount: integer(quality?.duplicate_blocks),
-      versionConflictRate: ratio(versionConflicts, actionExecutionSamples),
-      versionConflictSamples: actionExecutionSamples,
+      versionConflictRate: ratio(versionConflicts, versionConflictSamples),
+      versionConflictSamples,
       averageCompletedRounds: completedTasks > 0
         ? decimal(quality?.average_completed_rounds)
         : null,

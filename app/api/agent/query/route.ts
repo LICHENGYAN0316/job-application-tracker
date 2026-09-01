@@ -48,12 +48,16 @@ export async function POST(request: Request) {
       idempotencyKey: record.idempotencyKey,
       sessionId: record.sessionId,
       timeZone: record.timeZone,
+      timeZoneOffsetMinutes: record.timeZoneOffsetMinutes,
+      stateVersion: record.stateVersion,
     });
     if (result.ok) return privateJson(result);
     const status = result.code === 'quota_exhausted'
       ? 429
       : result.code === 'invalid_request'
         ? 400
+        : result.code === 'state_out_of_sync'
+          ? 409
         : result.code === 'technical_failure'
           ? 502
           : 503;

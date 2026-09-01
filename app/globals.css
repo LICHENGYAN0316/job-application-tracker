@@ -912,7 +912,7 @@ button:disabled, input:disabled, select:disabled, textarea:disabled { cursor: no
 .navigator-action-danger-note { border-radius: var(--radius-control); padding: var(--space-3) 14px; }
 .navigator-action-impact { border: 1px solid #cfded7; background: #f7fbf8; }
 .navigator-action-danger-note { border: 1px solid #dfb9b3; background: var(--color-danger-soft); color: #873f3a !important; font-weight: 700; }
-.navigator-action-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-2); }
+.navigator-action-buttons { display: grid; grid-template-columns: .9fr .9fr 1fr; gap: var(--space-2); }
 .navigator-action-buttons > button { width: 100%; }
 .danger-outline-button { min-height: 44px; border: 1px solid var(--color-danger); border-radius: var(--radius-control); background: var(--color-surface); color: var(--color-danger); padding: 0 18px; cursor: pointer; font-weight: 800; }
 .danger-outline-button:hover { background: var(--color-danger-soft); }

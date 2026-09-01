@@ -191,6 +191,7 @@ test('dashboard exposes privacy-safe user summaries and computes evidence-backed
       p95_latency_ms: 1_800,
       successful_sessions: 6,
       rated_tasks: 5,
+      feedback_tasks: 5,
       completed_tasks: 4,
       one_round_resolved_tasks: 3,
       average_completed_rounds: 2.25,
@@ -206,6 +207,7 @@ test('dashboard exposes privacy-safe user summaries and computes evidence-backed
       unauthorized_executions: 0,
       duplicate_blocks: 2,
       version_conflicts: 1,
+      version_conflict_samples: 4,
     },
   });
 
@@ -290,6 +292,16 @@ test('dashboard exposes privacy-safe user summaries and computes evidence-backed
   );
   assert.match(
     qualityQuery?.query ?? '',
+    /status IN \('success', 'technical_failure'\)[\s\S]*feedback IS NOT NULL/i,
+    'rated tasks must include feedback on technical failures without treating them as completed',
+  );
+  assert.match(
+    qualityQuery?.query ?? '',
+    /event_type IN \('execution_started', 'execution_conflict'\)/i,
+    'version-conflict samples must include conflicts rejected before execution starts',
+  );
+  assert.match(
+    qualityQuery?.query ?? '',
     /status = 'success' AND latency_ms > 0/i,
     'legacy zero-latency rows must not be presented as measured response times',
   );
@@ -308,6 +320,7 @@ test('dashboard reports empty and unavailable quality samples honestly instead o
       p95_latency_ms: null,
       successful_sessions: 0,
       rated_tasks: 0,
+      feedback_tasks: 0,
       completed_tasks: 0,
       one_round_resolved_tasks: 0,
       average_completed_rounds: 0,
@@ -323,6 +336,7 @@ test('dashboard reports empty and unavailable quality samples honestly instead o
       unauthorized_executions: 0,
       duplicate_blocks: 0,
       version_conflicts: 0,
+      version_conflict_samples: 0,
     },
   });
 

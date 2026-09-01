@@ -67,6 +67,7 @@ type AuthProvider = 'chatgpt' | 'github';
 type AgentMode = 'basic' | 'intelligent';
 type AgentFeedbackState = 'idle' | 'resolved' | 'unresolved' | 'error';
 type AgentActionFeedbackState = 'idle' | 'correct' | 'incorrect' | 'error';
+type AgentProposalReviewState = 'idle' | 'cancelled' | 'incorrect' | 'error';
 type AgentActionKind =
   | 'add_company'
   | 'add_job'
@@ -581,6 +582,76 @@ function qualityDurationLabel(value: number | null) {
   return value === null ? '暂无样本' : `${(value / 1_000).toFixed(value >= 10_000 ? 1 : 2)} 秒`;
 }
 
+function safeAgentCount(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+}
+
+function safeAgentRate(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1 ? value : null;
+}
+
+function safeAgentAverage(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function safeAgentLimit(value: unknown) {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= 100
+    ? value
+    : null;
+}
+
+function normalizeAgentAdminDashboard(dashboard: AgentAdminDashboard): AgentAdminDashboard {
+  const quality = dashboard?.quality ?? {} as AgentAdminDashboard['quality'];
+  const defaultLimit = safeAgentLimit(dashboard?.defaultLimit) ?? 5;
+  return {
+    globalEnabled: dashboard?.globalEnabled === true,
+    defaultLimit,
+    users: Array.isArray(dashboard?.users) ? dashboard.users.map((user) => ({
+      userNumber: safeAgentCount(user?.userNumber),
+      role: user?.role === 'admin' ? 'admin' : 'user',
+      disabled: user?.disabled === true,
+      limitOverride: safeAgentLimit(user?.limitOverride),
+      effectiveLimit: user?.role === 'admin' ? null : safeAgentLimit(user?.effectiveLimit) ?? defaultLimit,
+      used24h: safeAgentCount(user?.used24h),
+      lastCallAt: typeof user?.lastCallAt === 'string' && Number.isFinite(Date.parse(user.lastCallAt))
+        ? user.lastCallAt
+        : null,
+      totalTokens: safeAgentCount(user?.totalTokens),
+    })) : [],
+    totals: {
+      successfulCalls: safeAgentCount(dashboard?.totals?.successfulCalls),
+      totalTokens: safeAgentCount(dashboard?.totals?.totalTokens),
+    },
+    quality: {
+      technicalSuccessRate: safeAgentRate(quality.technicalSuccessRate),
+      technicalSamples: safeAgentCount(quality.technicalSamples),
+      taskSuccessRate: safeAgentRate(quality.taskSuccessRate),
+      ratedTasks: safeAgentCount(quality.ratedTasks),
+      oneRoundResolutionRate: safeAgentRate(quality.oneRoundResolutionRate),
+      oneRoundResolvedTasks: safeAgentCount(quality.oneRoundResolvedTasks),
+      feedbackCoverageRate: safeAgentRate(quality.feedbackCoverageRate),
+      feedbackEligibleTasks: safeAgentCount(quality.feedbackEligibleTasks),
+      toolParameterSchemaPassRate: safeAgentRate(quality.toolParameterSchemaPassRate),
+      toolParameterSamples: safeAgentCount(quality.toolParameterSamples),
+      actionExecutionSuccessRate: safeAgentRate(quality.actionExecutionSuccessRate),
+      actionExecutionSamples: safeAgentCount(quality.actionExecutionSamples),
+      ambiguitySafeClarificationRate: safeAgentRate(quality.ambiguitySafeClarificationRate),
+      ambiguitySamples: safeAgentCount(quality.ambiguitySamples),
+      wrongActionRate: safeAgentRate(quality.wrongActionRate),
+      actionFeedbackSamples: safeAgentCount(quality.actionFeedbackSamples),
+      unauthorizedExecutionCount: safeAgentCount(quality.unauthorizedExecutionCount),
+      duplicateBlockedCount: safeAgentCount(quality.duplicateBlockedCount),
+      versionConflictRate: safeAgentRate(quality.versionConflictRate),
+      versionConflictSamples: safeAgentCount(quality.versionConflictSamples),
+      averageCompletedRounds: safeAgentAverage(quality.averageCompletedRounds),
+      completedTasks: safeAgentCount(quality.completedTasks),
+      averageLatencyMs: safeAgentAverage(quality.averageLatencyMs),
+      p95LatencyMs: safeAgentAverage(quality.p95LatencyMs),
+      latencySamples: safeAgentCount(quality.latencySamples),
+    },
+  };
+}
+
 function metricAvailability(samples: number): AgentEvaluationRow['status'] {
   return samples > 0 ? '可用' : '等待样本';
 }
@@ -682,10 +753,10 @@ function buildAgentEvaluationRows(quality: AgentAdminDashboard['quality']): Agen
     },
     {
       category: '安全',
-      name: '用户确认误操作率',
+      name: '提案或操作有误率',
       value: qualityRateLabel(quality.wrongActionRate),
-      sample: `${quality.actionFeedbackSamples} 次操作评价`,
-      definition: '用户标记“操作有误”的执行操作 ÷ 全部已评价操作',
+      sample: `${quality.actionFeedbackSamples} 次提案与操作评价`,
+      definition: '用户标记“提案信息有误”或“操作有误”的记录 ÷ 全部已评价提案与操作',
       status: quality.actionFeedbackSamples === 0
         ? '等待样本'
         : quality.wrongActionRate === 0 ? '安全目标' : '需关注',
@@ -816,6 +887,7 @@ export default function Home() {
   const [agentActionCompleted, setAgentActionCompleted] = useState<AgentActionCompleted | null>(null);
   const [agentActionFeedback, setAgentActionFeedback] = useState<AgentActionFeedbackState>('idle');
   const [agentActionFeedbackLoading, setAgentActionFeedbackLoading] = useState(false);
+  const [agentProposalReview, setAgentProposalReview] = useState<AgentProposalReviewState>('idle');
   const [agentAdminOpen, setAgentAdminOpen] = useState(false);
   const [agentAdminDashboard, setAgentAdminDashboard] = useState<AgentAdminDashboard | null>(null);
   const [agentAdminLoading, setAgentAdminLoading] = useState(false);
@@ -936,6 +1008,7 @@ export default function Home() {
     setAgentActionCompleted(null);
     setAgentActionFeedback('idle');
     setAgentActionFeedbackLoading(false);
+    setAgentProposalReview('idle');
     agentSessionIdRef.current = '';
     agentQueryInFlightRef.current = false;
     agentFeedbackInFlightRef.current = false;
@@ -998,10 +1071,11 @@ export default function Home() {
   }, [clearCurrentAccountFromDevice]);
 
   const applyAgentAdminDashboard = useCallback((dashboard: AgentAdminDashboard) => {
-    agentAdminDashboardRef.current = dashboard;
-    setAgentAdminDashboard(dashboard);
-    setAgentDefaultLimitDraft(String(dashboard.defaultLimit));
-    setAgentUserLimitDrafts(Object.fromEntries(dashboard.users.flatMap((user) => (
+    const normalizedDashboard = normalizeAgentAdminDashboard(dashboard);
+    agentAdminDashboardRef.current = normalizedDashboard;
+    setAgentAdminDashboard(normalizedDashboard);
+    setAgentDefaultLimitDraft(String(normalizedDashboard.defaultLimit));
+    setAgentUserLimitDrafts(Object.fromEntries(normalizedDashboard.users.flatMap((user) => (
       user.role === 'admin' || user.effectiveLimit === null
         ? []
         : [[user.userNumber, String(user.effectiveLimit)]]
@@ -1102,6 +1176,7 @@ export default function Home() {
     setAgentActionCompleted(null);
     setAgentActionFeedback('idle');
     setAgentActionFeedbackLoading(false);
+    setAgentProposalReview('idle');
     agentSessionIdRef.current = crypto.randomUUID();
     setNavigatorOpen(true);
     void refreshAgentStatus();
@@ -2285,13 +2360,78 @@ export default function Home() {
     setAgentActionError('');
     setAgentActionCompleted(null);
     setAgentActionFeedback('idle');
+    setAgentProposalReview('idle');
     let timeZone = '';
+    let timeZoneOffsetMinutes: number | null = null;
     try {
       timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
     } catch {
-      // The server will stop relative-date requests safely if the browser cannot expose a time zone.
+      // The numeric browser offset below remains available as a safe fallback.
     }
     try {
+      const offset = new Date().getTimezoneOffset();
+      if (Number.isSafeInteger(offset) && offset >= -840 && offset <= 840) {
+        timeZoneOffsetMinutes = offset;
+      }
+    } catch {
+      // The server will stop relative-date requests safely if neither browser value is available.
+    }
+    try {
+      if (!cloudSyncEnabled.current) {
+        failureMessage = '当前求职数据还没有完成云端同步，为避免智能助手读到旧版本，本次没有调用模型。请先处理页面上的同步提示。';
+        throw new Error('agent_state_sync_unavailable');
+      }
+      if (saveTimerRef.current !== null) {
+        window.clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+      }
+      saveSequence.current += 1;
+      await saveQueueRef.current;
+      if (activeUserIdRef.current !== expectedUserId || !cloudSyncEnabled.current) {
+        failureMessage = '账号或数据同步状态已变化，本次没有调用模型。请刷新页面后重试。';
+        throw new Error('agent_account_or_sync_changed');
+      }
+      const syncResponse = await fetch('/api/state', {
+        method: 'PUT',
+        headers: {
+          'content-type': 'application/json',
+          'x-state-base-version': cloudVersionRef.current,
+          'x-expected-user-id': expectedUserId,
+        },
+        body: JSON.stringify({ companies }),
+      });
+      if (syncResponse.status === 409) {
+        const conflict = await syncResponse.json().catch(() => null) as { error?: string } | null;
+        if (conflict?.error === 'account_context_changed') {
+          replaceAfterAccountContextChange('loading');
+          return;
+        }
+        cloudSyncEnabled.current = false;
+        setSyncStatus('error');
+        failureMessage = '云端数据已在另一个页面发生变化。为避免覆盖新数据，本次没有调用模型。请先刷新并核对数据。';
+        throw new Error('agent_state_version_conflict');
+      }
+      if (!syncResponse.ok) {
+        failureMessage = '求职数据未能完成同步，为避免智能助手读到旧版本，本次没有调用模型。请稍后重试。';
+        throw new Error('agent_state_sync_failed');
+      }
+      const synced = await syncResponse.json() as { version?: string };
+      if (!synced.version) throw new Error('agent_state_sync_version_missing');
+      cloudVersionRef.current = synced.version;
+      try {
+        if (activeStorageKeyRef.current) {
+          window.localStorage.setItem(activeStorageKeyRef.current, JSON.stringify({
+            companies,
+            dirty: false,
+            savedAt: new Date().toISOString(),
+            baseVersion: synced.version,
+          }));
+        }
+      } catch {
+        // The verified cloud state remains authoritative when local cache is unavailable.
+      }
+      setSyncStatus('synced');
+
       const response = await fetch('/api/agent/query', {
         method: 'POST',
         headers: {
@@ -2303,11 +2443,18 @@ export default function Home() {
           idempotencyKey: crypto.randomUUID(),
           sessionId: agentSessionIdRef.current,
           timeZone,
+          timeZoneOffsetMinutes,
+          stateVersion: cloudVersionRef.current,
         }),
       });
       if (response.status === 409) {
-        replaceAfterAccountContextChange('loading');
-        return;
+        const conflict = await response.json().catch(() => null) as { error?: string; message?: string } | null;
+        if (conflict?.error === 'account_context_changed') {
+          replaceAfterAccountContextChange('loading');
+          return;
+        }
+        failureMessage = conflict?.message || '求职数据还在同步，本次没有调用模型。请等待“云端已同步”后重试。';
+        throw new Error('agent_state_out_of_sync');
       }
       const payload = await response.json().catch(() => null) as {
         ok?: boolean;
@@ -2322,15 +2469,16 @@ export default function Home() {
         setAgentStatus(payload.status);
         agentStatusFetchedAtRef.current = Date.now();
       }
+      if (payload?.callId) setAgentCallId(payload.callId);
       const hasProposal = payload?.responseType === 'proposal' && Boolean(payload.proposal);
       const hasAnswer = Boolean(payload?.answer);
-      if (!response.ok || !payload?.ok || (!hasAnswer && !hasProposal) || !payload.callId) {
+      if (!response.ok || !payload?.ok || (!hasAnswer && !hasProposal)) {
         if (payload?.message) failureMessage = payload.message;
         throw new Error('agent_request_failed');
       }
       setAgentAnswer(payload.answer ?? '');
       setAgentActionProposal(payload.proposal ?? null);
-      setAgentCallId(payload.callId);
+      setAgentCallId(payload.callId ?? '');
     } catch {
       setAgentError(failureMessage);
       setAgentMode('basic');
@@ -2372,16 +2520,17 @@ export default function Home() {
     }
   };
 
-  const cancelAgentAction = async () => {
+  const cancelAgentAction = async (review: 'cancelled' | 'incorrect' = 'cancelled') => {
     const proposal = agentActionProposal;
     const expectedUserId = activeUserIdRef.current;
     if (!proposal || agentActionLoading) return;
     setAgentActionConfirmOpen(false);
     setAgentActionProposal(null);
     setAgentActionError('');
+    setAgentProposalReview('idle');
     if (!expectedUserId) return;
     try {
-      await fetch(`/api/agent/action/${encodeURIComponent(proposal.id)}/cancel`, {
+      const cancelResponse = await fetch(`/api/agent/action/${encodeURIComponent(proposal.id)}/cancel`, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
@@ -2389,8 +2538,23 @@ export default function Home() {
         },
         body: JSON.stringify({ confirmationNonce: proposal.confirmationNonce }),
       });
+      if (!cancelResponse.ok) throw new Error('proposal_cancel_failed');
+      const cancelPayload = await cancelResponse.json().catch(() => null) as { message?: string } | null;
+      setAgentAnswer(cancelPayload?.message || '这次操作已取消，没有修改求职数据。');
+      if (review === 'incorrect') {
+        const feedbackResponse = await fetch(`/api/agent/action/${encodeURIComponent(proposal.id)}/feedback`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-expected-user-id': expectedUserId,
+          },
+          body: JSON.stringify({ outcome: 'incorrect' }),
+        });
+        if (!feedbackResponse.ok) throw new Error('proposal_feedback_failed');
+      }
+      setAgentProposalReview(review);
     } catch {
-      // The proposal also expires automatically; cancelling must never block the UI.
+      setAgentProposalReview('error');
     }
   };
 
@@ -2451,6 +2615,7 @@ export default function Home() {
       setAgentActionProposal(null);
       setAgentActionConfirmOpen(false);
       setAgentActionFeedback('idle');
+      setAgentAnswer(payload.message || '操作已确认并保存。');
       showNotice(payload.message || '操作已确认完成。');
     } catch (error) {
       setAgentActionError(error instanceof Error ? error.message : '这次操作没有完成，你的求职数据没有被改动。');
@@ -3434,23 +3599,23 @@ export default function Home() {
                   <p className="eyebrow">智能分析</p>
                   <h3>给你的建议</h3>
                   <p>{agentAnswer}</p>
-                  <div className="navigator-agent-feedback" aria-label="评价这次智能分析">
+                  {agentCallId && <div className="navigator-agent-feedback" aria-label="评价这次智能分析">
                     {agentFeedback === 'resolved' || agentFeedback === 'unresolved' ? (
                       <p role="status">
                         {agentFeedback === 'resolved'
-                          ? '已记录为任务完成，谢谢你的反馈。'
-                          : '已记录为还需继续，你可以补充信息后接着提问。'}
+                          ? '已记录为有帮助，谢谢你的反馈。'
+                          : '已记录为信息有误或仍需完善，你可以继续补充情况。'}
                       </p>
                     ) : (
                       <>
-                        <span>{agentFeedback === 'error' ? '刚才没有记录成功，要再试一次吗？' : '这次建议解决了你的问题吗？'}</span>
+                        <span>{agentFeedback === 'error' ? '刚才没有记录成功，要再试一次吗？' : '这次回答对你有帮助吗？'}</span>
                         <div>
-                          <button type="button" disabled={agentFeedbackLoading} onClick={() => void submitAgentFeedback('resolved')}>已解决</button>
-                          <button type="button" disabled={agentFeedbackLoading} onClick={() => void submitAgentFeedback('unresolved')}>还需继续</button>
+                          <button type="button" disabled={agentFeedbackLoading} onClick={() => void submitAgentFeedback('resolved')}>有帮助</button>
+                          <button type="button" disabled={agentFeedbackLoading} onClick={() => void submitAgentFeedback('unresolved')}>信息有误</button>
                         </div>
                       </>
                     )}
-                  </div>
+                  </div>}
                 </article>
               )}
               {agentMode === 'intelligent' && agentActionProposal && !agentQueryLoading && (
@@ -3473,6 +3638,7 @@ export default function Home() {
                   </p>
                   <div className="navigator-action-buttons">
                     <button type="button" className="secondary-button" data-autofocus onClick={() => void cancelAgentAction()}>取消本次操作</button>
+                    <button type="button" className="secondary-button" onClick={() => void cancelAgentAction('incorrect')}>提案信息有误</button>
                     <button
                       type="button"
                       className={agentActionProposal.destructive ? 'danger-outline-button' : 'primary-button'}
@@ -3481,6 +3647,17 @@ export default function Home() {
                       继续确认
                     </button>
                   </div>
+                </article>
+              )}
+              {agentMode === 'intelligent' && agentProposalReview !== 'idle' && !agentActionProposal && !agentActionCompleted && !agentQueryLoading && (
+                <article className="navigator-action-completed" aria-live="polite">
+                  <p className="eyebrow">提案结果</p>
+                  <h3>已取消，没有修改求职数据</h3>
+                  <p>{agentProposalReview === 'incorrect'
+                    ? '已记录为“提案信息有误”，管理面板会把这次反馈纳入质量统计。'
+                    : agentProposalReview === 'error'
+                      ? '提案已从页面关闭，但反馈暂时没有保存；你可以重新描述后再试。'
+                      : '这次提案已安全取消。'}</p>
                 </article>
               )}
               {agentMode === 'intelligent' && agentActionCompleted && !agentQueryLoading && (
@@ -3511,7 +3688,25 @@ export default function Home() {
               )}
               {agentError && !agentQueryLoading && (
                 <div className="navigator-agent-error" role="alert">
-                  <div><strong>{agentMode === 'basic' ? '已切换到基础助手' : '这次分析没有完成'}</strong><p>{agentError}</p></div>
+                  <div>
+                    <strong>{agentMode === 'basic' ? '已切换到基础助手' : '这次分析没有完成'}</strong>
+                    <p>{agentError}</p>
+                    {agentCallId && (
+                      <div className="navigator-agent-feedback" aria-label="评价这次失败结果">
+                        {agentFeedback === 'resolved' || agentFeedback === 'unresolved' ? (
+                          <p role="status">{agentFeedback === 'resolved' ? '已记录为仍有帮助。' : '已记录为信息有误。'}</p>
+                        ) : (
+                          <>
+                            <span>{agentFeedback === 'error' ? '反馈未保存，要再试一次吗？' : '这次失败提示是否准确？'}</span>
+                            <div>
+                              <button type="button" disabled={agentFeedbackLoading} onClick={() => void submitAgentFeedback('resolved')}>仍有帮助</button>
+                              <button type="button" disabled={agentFeedbackLoading} onClick={() => void submitAgentFeedback('unresolved')}>信息有误</button>
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
                   <div>
                     <button
                       type="button"
@@ -3756,7 +3951,11 @@ export default function Home() {
 
       {agentActionConfirmOpen && agentActionProposal && (
         <Modal
-          title={agentActionProposal.destructive ? '最后确认删除' : '最后确认新增'}
+          title={agentActionProposal.destructive
+            ? '最后确认删除'
+            : agentActionProposal.actionKind.startsWith('update_')
+              ? '最后确认修改'
+              : '最后确认新增'}
           onClose={() => void cancelAgentAction()}
           busy={agentActionLoading}
         >
@@ -3789,7 +3988,9 @@ export default function Home() {
                   ? '正在安全执行…'
                   : agentActionProposal.destructive
                     ? '确认删除'
-                    : '确认新增'}
+                    : agentActionProposal.actionKind.startsWith('update_')
+                      ? '确认修改'
+                      : '确认新增'}
               </button>
             </div>
           </div>
