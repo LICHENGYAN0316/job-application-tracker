@@ -1,4 +1,3 @@
-import { ensureCloudSchemaOnce } from '@/db/schema';
 import {
   cancelAgentAction,
   type AgentActionDatabase,
@@ -34,7 +33,6 @@ export async function POST(request: Request, context: RouteContext) {
   }
   try {
     const database = cloudflareDatabase();
-    await ensureCloudSchemaOnce(database);
     const principal = await resolveAuthPrincipal(request, database);
     if (!principal) return privateJson({ error: 'sign_in_required' }, { status: 401 });
     if (!hasExpectedUserContext(request, principal.id)) {

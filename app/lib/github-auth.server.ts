@@ -8,29 +8,6 @@ export const GITHUB_OAUTH_STATE_TTL_MS = 10 * 60 * 1_000;
 export const GITHUB_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
 export const GITHUB_PROVIDER_TIMEOUT_MS = 5_000;
 
-export const createGithubOauthStatesTableSql = `
-  CREATE TABLE IF NOT EXISTS github_oauth_states (
-    state_hash TEXT PRIMARY KEY,
-    code_verifier TEXT NOT NULL,
-    redirect_uri TEXT NOT NULL,
-    created_at_ms INTEGER NOT NULL,
-    expires_at_ms INTEGER NOT NULL,
-    consumed_at_ms INTEGER
-  ) WITHOUT ROWID
-`;
-
-export const createGithubSessionsTableSql = `
-  CREATE TABLE IF NOT EXISTS github_sessions (
-    session_hash TEXT PRIMARY KEY,
-    account_key TEXT NOT NULL,
-    github_subject TEXT NOT NULL,
-    display_login TEXT NOT NULL DEFAULT '',
-    created_at_ms INTEGER NOT NULL,
-    expires_at_ms INTEGER NOT NULL,
-    revoked_at_ms INTEGER
-  ) WITHOUT ROWID
-`;
-
 export type GithubAuthStatement = {
   bind: (...values: unknown[]) => GithubAuthStatement;
   first: <T>() => Promise<T | null>;
@@ -82,7 +59,6 @@ type GithubUserResponse = {
 
 export type GithubAuthDependencies = {
   database: () => GithubAuthDatabase;
-  ensureSchema: (database: GithubAuthDatabase) => Promise<void>;
   configuration: () => GithubAuthConfiguration;
   fetch?: typeof fetch;
   providerTimeoutMs?: number;
@@ -315,7 +291,6 @@ export function createGithubAuthHandlers(dependencies: GithubAuthDependencies) {
     try {
       const configuration = validatedGithubConfiguration(dependencies.configuration());
       const database = dependencies.database();
-      await dependencies.ensureSchema(database);
       await bestEffortCleanupGithubAuthRecords(database, now());
 
       const state = base64Url(randomBytes(32));
@@ -380,7 +355,6 @@ export function createGithubAuthHandlers(dependencies: GithubAuthDependencies) {
       ) return failed();
 
       const database = dependencies.database();
-      await dependencies.ensureSchema(database);
       await bestEffortCleanupGithubAuthRecords(database, now());
       const stateHash = await sha256Base64Url(returnedState);
       const stateRow = await database.prepare(`
@@ -474,10 +448,14 @@ export function createGithubAuthHandlers(dependencies: GithubAuthDependencies) {
 
   const SESSION = async (request: Request) => {
     try {
+      const token = requestCookie(request, GITHUB_SESSION_COOKIE);
+      if (!validOpaqueToken(token)) {
+        const headers = privateHeaders();
+        headers.append('set-cookie', clearCookie(GITHUB_SESSION_COOKIE));
+        return Response.json({ authenticated: false }, { headers });
+      }
       const database = dependencies.database();
-      await dependencies.ensureSchema(database);
-      await bestEffortCleanupGithubAuthRecords(database, now());
-      const session = await resolveGithubSession(request, database, now());
+      const session = await resolveSessionToken(database, token, now());
       if (!session) {
         const headers = privateHeaders();
         headers.append('set-cookie', clearCookie(GITHUB_SESSION_COOKIE));
@@ -516,18 +494,15 @@ export function createGithubAuthHandlers(dependencies: GithubAuthDependencies) {
       return privateJson({ error: 'invalid_request_origin' }, { status: 403 });
     }
 
+    const token = requestCookie(request, GITHUB_SESSION_COOKIE);
+    if (!validOpaqueToken(token)) return signedOutResponse({ ok: true }, 200);
+
     try {
       const database = dependencies.database();
-      await dependencies.ensureSchema(database);
-      const token = requestCookie(request, GITHUB_SESSION_COOKIE);
-      if (validOpaqueToken(token)) {
-        await database.prepare(`
-          UPDATE github_sessions
-          SET revoked_at_ms = ?
-          WHERE session_hash = ? AND revoked_at_ms IS NULL
-        `).bind(now(), await sha256Base64Url(token)).run();
-      }
-      await bestEffortCleanupGithubAuthRecords(database, now());
+      await database.prepare(`
+        DELETE FROM github_sessions
+        WHERE session_hash = ?
+      `).bind(await sha256Base64Url(token)).run();
       return signedOutResponse({ ok: true }, 200);
     } catch {
       return signedOutResponse({ error: 'github_signout_unavailable' }, 503);

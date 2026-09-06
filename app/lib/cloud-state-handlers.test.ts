@@ -140,7 +140,6 @@ test('A/B 用户、相同邮箱、账号切换和删除始终严格隔离', asyn
   let versionSequence = 0;
   const handlers = createCloudStateHandlers({
     database: () => database,
-    ensureSchema: async () => undefined,
     now: () => '2026-08-31T00:00:00.000Z',
     randomId: () => `version-${++versionSequence}`,
   });
@@ -209,7 +208,6 @@ test('非法认证 ID 被拒绝，且实际超大流不进入 D1', async () => {
   const database = new FakeDatabase();
   const handlers = createCloudStateHandlers({
     database: () => database,
-    ensureSchema: async () => undefined,
   });
 
   const invalidId = await handlers.GET(apiRequest(

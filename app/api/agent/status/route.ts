@@ -1,4 +1,3 @@
-import { ensureCloudSchemaOnce } from '@/db/schema';
 import { agentRuntimeConfig, getAgentUserStatus } from '@/app/lib/agent-service.server';
 import { AuthPrincipalConflictError, resolveAuthPrincipal } from '@/app/lib/auth-principal.server';
 import { hasExpectedUserContext } from '@/app/lib/user-scope';
@@ -9,7 +8,6 @@ export const dynamic = 'force-dynamic';
 export async function GET(request: Request) {
   try {
     const database = cloudflareDatabase();
-    await ensureCloudSchemaOnce(database);
     const principal = await resolveAuthPrincipal(request, database);
     if (!principal) return privateJson({ error: 'sign_in_required' }, { status: 401 });
     if (!hasExpectedUserContext(request, principal.id)) {

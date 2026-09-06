@@ -1,4 +1,3 @@
-import { ensureCloudSchemaOnce } from '@/db/schema';
 import { readBoundedJson, InvalidJsonBodyError, RequestBodyTooLargeError } from '@/app/lib/bounded-json';
 import {
   AgentAdminForbiddenError,
@@ -46,7 +45,6 @@ function errorResponse(error: unknown) {
 export async function GET(request: Request) {
   try {
     const database = cloudflareDatabase();
-    await ensureCloudSchemaOnce(database);
     const environment = runtimeEnvironment();
     const principal = await resolveAuthPrincipal(request, database);
     if (!principal) return privateJson({ error: 'sign_in_required' }, { status: 401 });
@@ -82,7 +80,6 @@ export async function PATCH(request: Request) {
 
   try {
     const database = cloudflareDatabase();
-    await ensureCloudSchemaOnce(database);
     const environment = runtimeEnvironment();
     const principal = await resolveAuthPrincipal(request, database);
     if (!principal) return privateJson({ error: 'sign_in_required' }, { status: 401 });

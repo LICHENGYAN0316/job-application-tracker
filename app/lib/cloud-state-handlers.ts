@@ -21,7 +21,6 @@ const ALLOWED_STAGES = new Set<string>(STAGES);
 
 export type StateHandlerDependencies = WriteDependencies & {
   database: () => StateDatabase;
-  ensureSchema: (database: StateDatabase) => Promise<void>;
   authenticate?: (request: Request, database: StateDatabase) => Promise<AuthenticatedUser | null>;
 };
 
@@ -86,7 +85,6 @@ export function createCloudStateHandlers(dependencies: StateHandlerDependencies)
   const GET = async (request: Request) => {
     try {
       const database = dependencies.database();
-      await dependencies.ensureSchema(database);
       const user = dependencies.authenticate
         ? await dependencies.authenticate(request, database)
         : authenticatedUser(request);
@@ -102,7 +100,6 @@ export function createCloudStateHandlers(dependencies: StateHandlerDependencies)
     const database = dependencies.database();
     let user: AuthenticatedUser | null;
     try {
-      await dependencies.ensureSchema(database);
       user = dependencies.authenticate
         ? await dependencies.authenticate(request, database)
         : authenticatedUser(request);
@@ -146,7 +143,6 @@ export function createCloudStateHandlers(dependencies: StateHandlerDependencies)
     const database = dependencies.database();
     let user: AuthenticatedUser | null;
     try {
-      await dependencies.ensureSchema(database);
       user = dependencies.authenticate
         ? await dependencies.authenticate(request, database)
         : authenticatedUser(request);

@@ -60,6 +60,11 @@ class FakeStatement implements GithubAuthStatement {
   }
 
   async run() {
+    if (/DELETE FROM\s+github_sessions[\s\S]*WHERE\s+session_hash\s*=\s*\?/i.test(this.query)) {
+      if (this.database.failSessionUpdate) throw new Error('Simulated GitHub session removal failure');
+      return { meta: { changes: this.database.sessions.delete(String(this.values[0])) ? 1 : 0 } };
+    }
+
     if (/DELETE FROM\s+github_oauth_states/i.test(this.query)) {
       if (this.database.failCleanup) throw new Error('Simulated OAuth state cleanup failure');
       const timestamp = Number(this.values[0]);
@@ -141,8 +146,10 @@ class FakeDatabase implements GithubAuthDatabase {
   readonly sessions = new Map<string, SessionRow>();
   failCleanup = false;
   failSessionUpdate = false;
+  prepareCalls = 0;
 
   prepare(query: string) {
+    this.prepareCalls += 1;
     return new FakeStatement(query, this);
   }
 }
@@ -168,7 +175,6 @@ function dependencies(
 ) {
   return {
     database: () => database,
-    ensureSchema: async () => undefined,
     configuration: () => ({
       clientId: 'github-client-id',
       clientSecret: 'github-client-secret',
@@ -506,4 +512,33 @@ test('malformed cookies are ignored', () => {
     headers: { cookie: `${GITHUB_SESSION_COOKIE}=%E0%A4%A` },
   });
   assert.equal(requestCookie(request, GITHUB_SESSION_COOKIE), '');
+});
+
+test('session check without a valid GitHub cookie returns immediately without D1 access', async () => {
+  const database = new FakeDatabase();
+  const handlers = createGithubAuthHandlers(dependencies(database));
+
+  const response = await handlers.SESSION(new Request('https://example.com/api/auth/github/session'));
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { authenticated: false });
+  assert.equal(database.prepareCalls, 0);
+  assert.equal(cookieValue(response, GITHUB_SESSION_COOKIE), '');
+});
+
+test('signout without a valid GitHub cookie clears this device immediately without D1 access', async () => {
+  const database = new FakeDatabase();
+  const handlers = createGithubAuthHandlers(dependencies(database));
+
+  const response = await handlers.SIGNOUT(new Request('https://example.com/api/auth/github/signout', {
+    method: 'POST',
+    headers: { origin: 'https://example.com' },
+  }));
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true });
+  assert.equal(response.headers.get('x-zhixu-device-session-cleared'), '1');
+  assert.equal(database.prepareCalls, 0);
+  assert.equal(cookieValue(response, GITHUB_SESSION_COOKIE), '');
+  assert.equal(cookieValue(response, GITHUB_OAUTH_STATE_COOKIE), '');
 });

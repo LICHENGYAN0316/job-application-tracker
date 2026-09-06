@@ -1,4 +1,3 @@
-import { ensureCloudSchemaOnce } from '@/db/schema';
 import { readBoundedJson, InvalidJsonBodyError, RequestBodyTooLargeError } from '@/app/lib/bounded-json';
 import { recordAgentFeedback } from '@/app/lib/agent-service.server';
 import { AuthPrincipalConflictError, resolveAuthPrincipal } from '@/app/lib/auth-principal.server';
@@ -31,7 +30,6 @@ export async function POST(request: Request) {
 
   try {
     const database = cloudflareDatabase();
-    await ensureCloudSchemaOnce(database);
     const principal = await resolveAuthPrincipal(request, database);
     if (!principal) return privateJson({ error: 'sign_in_required' }, { status: 401 });
     if (!hasExpectedUserContext(request, principal.id)) {

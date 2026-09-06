@@ -1,5 +1,4 @@
 import { env } from 'cloudflare:workers';
-import { ensureCloudSchemaOnce } from '@/db/schema';
 import {
   AuthenticationContextConflictError,
   createCloudStateHandlers,
@@ -27,7 +26,6 @@ function database() {
 
 const handlers = createCloudStateHandlers({
   database: () => database() as unknown as StateDatabase,
-  ensureSchema: (stateDatabase) => ensureCloudSchemaOnce(stateDatabase as unknown as D1Database),
   authenticate: async (request, stateDatabase) => {
     try {
       const principal = await resolveAuthPrincipal(request, stateDatabase);

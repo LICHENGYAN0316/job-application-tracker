@@ -1,5 +1,4 @@
 import { env } from 'cloudflare:workers';
-import { ensureCloudSchemaOnce } from '@/db/schema';
 import {
   createGithubAuthHandlers,
   type GithubAuthConfiguration,
@@ -34,6 +33,5 @@ function configuration(): GithubAuthConfiguration {
 
 export const githubAuthHandlers = createGithubAuthHandlers({
   database,
-  ensureSchema: (authDatabase) => ensureCloudSchemaOnce(authDatabase as unknown as D1Database),
   configuration,
 });

@@ -12,7 +12,7 @@
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "test:agent": "node --experimental-strip-types --test app/lib/career-navigator.test.ts app/lib/agent-service.server.test.ts app/lib/agent-actions.server.test.ts app/lib/agent-admin.server.test.ts app/lib/agent-admin.sqlite.test.ts",
     "test:user-scope": "node --experimental-strip-types --test app/lib/user-scope.test.ts app/lib/github-auth.server.test.ts",
-    "test:cloud-state": "node --experimental-strip-types --test app/lib/bounded-json.test.ts app/lib/cloud-state-handlers.test.ts",
+    "test:cloud-state": "node --experimental-strip-types --test app/lib/bounded-json.test.ts app/lib/cloud-state-handlers.test.ts app/lib/runtime-schema-boundary.test.ts",
     "test": "npm run test:agent && npm run test:user-scope && npm run test:cloud-state"
   },
   "dependencies": {
